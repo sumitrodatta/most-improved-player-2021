@@ -1,0 +1,77 @@
+---
+title: "Predicting the Winner of NBA's 2021 Most Improved Player Award, and Finding Candidates for 2022"
+author: "Sumitro Datta"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(cache=TRUE,
+                      echo = TRUE,
+                      warning = FALSE,
+                      message = FALSE)
+```
+
+# Re-Introduction
+
+For my HarvardX capstone project, I performed an analysis on whether I could predict this year's Most Improved Player and next year's candidates (found here). With the 2019-2020 regular season being restarted in Orlando, I decided to go back and improve on it. Major changes include:
+
+* a more robust dataset (instead of using the IMPORTHTML function on Google Sheets multiple times, I learned how to webscrape)
+* a new variable (experience or seasons played in the league)
+* different machine learning models (a decision tree does not lend itself to use with this many granular decimals)
+
+# Introduction
+
+As the beginning of a new NBA season nears, predictions start to roll in from pundits. In terms of major player awards, the Most Improved Player is the most "predicted by gut feeling".
+
+* there are usually a select group of players that have a chance at Most Valuable Player and Defensive Player of the Year, with minor turnover year-over-year
+* Sixth Man of the Year (given to the best performing player that does not start the game on the court) has morphed into a type: the high scoring guard that ironically often places in the top 5 in minutes played on the team
+    + a guard has won 13 of the past 15 years, and the winner regardless of position has placed in the top 5 in minutes played on the team 12 of the 15 years
+* Rookie of the Year, by definition, has turnover every year, but predictions tend towards players taken near the beginning of the draft
+
+The goal of this analysis is to use machine learning to make a two-fold prediction.
+
+1. Predict the winner of this year's (2021) MIP award.
+2. Predict candidates of next year's (2022) MIP award.
+
+Steps that were performed:
+
+1. loading the data and swapping NA's with 0's
+2. visualizing how MIP winners have performed and how much vote share they received
+3. create a version of the data that shows statistical jumps (current season minus previous season)
+4. separating out evaluation sets (the 2020 season) and test sets (the 1987 season for predicting the 2020 winner, the 1986 and 2019 seasons for predicting 2021 candidates)
+5. training five models: a linear baseline, a k-nearest-neighbors model, two separate random forest models and a support vector machine model
+
+Note: to simplify the Season column, I refer to each season by its second half. So you might also hear the current season referred to as the 2020-2021 season.
+\newpage
+
+# Methods/Analysis
+
+## Loading Packages
+
+Let's start by loading required packages.
+```{r load_pkgs, results="hide"}
+if(!require(tidyverse)) 
+  install.packages("tidyverse", repos = "http://cran.us.r-project.org")
+if(!require(caret)) 
+  install.packages("caret", repos = "http://cran.us.r-project.org")
+if(!require(readxl)) 
+  install.packages("readxl", repos = "http://cran.us.r-project.org")
+#Rborist and ranger are random forest algorithm wrappers
+if(!require(Rborist)) 
+  install.packages("Rborist", repos = "http://cran.us.r-project.org")
+if(!require(ranger)) 
+  install.packages("ranger", repos = "http://cran.us.r-project.org")
+#matrix stats
+if(!require(matrixStats)) 
+  install.packages("matrixStats", repos = "http://cran.us.r-project.org")
+#rpart.plot shows the decision tree of an rpart result
+if(!require(rpart.plot)) 
+  install.packages("rpart.plot", repos = "http://cran.us.r-project.org")
+#kableExtra allows more customization of tables
+if(!require(kableExtra)) 
+  install.packages("kableExtra")
+if(!require(RColorBrewer)) 
+  install.packages("RColorBrewer", repos = "http://cran.us.r-project.org")
+
+```
