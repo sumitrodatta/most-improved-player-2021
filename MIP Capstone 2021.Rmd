@@ -14,7 +14,7 @@ knitr::opts_chunk$set(cache = TRUE,
 
 # Re-Introduction
 
-For my HarvardX capstone project, I performed an analysis on whether I could predict this year's Most Improved Player and next year's candidates (found here). With the 2019-2020 regular season being restarted in Orlando, I decided to go back and improve on it. Major changes include:
+For my HarvardX capstone project, I performed an analysis on whether I could predict last year's Most Improved Player and this year's candidates (found here). With the 2020-2021 regular season in the books, I decided to go back and improve on it. Major changes include:
 
 * a more robust dataset (instead of using the IMPORTHTML function on Google Sheets multiple times, I learned how to webscrape)
 * a new variable (experience or seasons played in the league)
@@ -423,3 +423,118 @@ models %>% knitr::kable()
 ```
 
 The RMSE has improved and the probabilities have grown. The highest share in the linear model is lower than the 3rd highest share in the knn model. KNN predicts Dale Ellis as the winner. We've already discussed the shortcomings of modelling in regards to Jordan's 1987 season. Cage increased his points per game by nine and upped his shooting percentage by 4% while cutting down his fouling rate.
+
+The next two models are random forests which return the average of multiple decision trees. The intuition behind using models from the decision tree family is that maybe there are certain statistical thresholds that a potential MIP winner needs to meet in order to merit consideration. As a player passes more of these checkpoints, their vote share increases. Random forests are better than decision trees in that they reduce instability by averaging multiple trees. Unfortunately, the cost is interpretability. There is no tree diagram that is representative of the decisions made. We will be using `ranger` and `Rborist` rather than `randomForest` to decrease computational time. Since ranger and Rborist are *random* forest algorithms, we need to set a seed to keep the work reproducible.
+
+Ranger creates 500 trees. Random forest algorithms require an explicit call for variable importance, so we'll ask for permutation importance. A simplified explanation for permutation importance is shuffling a predictor's values and seeing how much the error increases. As a predictor's importance increases, it is difficult for the rest of the model to compute accurate predictions without it. In addition, ranger has 3 tuning parameters:
+
+* mtry is the number of variables to split at each decision node
+    + the default is the rounded square root of the number of variables, which in this case would be `round(sqrt(64))`
+* splitrule is the rule used to split a node
+    + the default is to minimize variance
+* min.node.size is the minimum number of observations needed to split a node
+    + the default is 5 for a regression problem like this
+    
+Unfortunately, due to limited computing capacity, we'll be using the defaults.
+```{r this_year_ranger,results='hide'}
+set.seed(20,sample.kind = "Rounding")
+ranger<-train(share~.,data=full_jumps_data %>%
+                select(-c(seas_id,season,player_id,player,g_diff,gs_diff)),
+              method="ranger", importance="permutation",
+              trControl=trainControl(method="cv",number=10,p=0.9))
+```
+Let's get the top 5 most important variables of the ranger model.
+```{r ranger_top_vars, echo=FALSE}
+get_5_top_important(ranger)
+```
+The top 5 variables all heed from the per-game subset, with the top 3 in a separate tier of importance from the others.
+```{r ranger_1987, echo=FALSE}
+models<-bind_rows(models,eval_table(ranger,"Ranger"))
+models %>% knitr::kable()
+```
+
+Ellis is also predicted to win here, with Cage & Jordan swapping positions from KNN.
+
+Rborist is another R package for random forest machine learning. It has two tuning parameters: predFixed is equivalent to mtry in ranger, and minNode is equivalent to min.node.size in ranger. As above, we'll be using the defaults due to limited computing capacity.
+```{r this_year_rborist,results='hide'}
+set.seed(25,sample.kind="Rounding")
+rborist<-train(share~.,data=full_jumps_data %>%
+                select(-c(seas_id,season,player_id,player,g_diff,gs_diff)),
+              method="Rborist", importance="permutation",
+              trControl=trainControl(method="cv",number=10,p=0.9))
+```
+Let's get the top 5 most important variables of the Rborist model.
+```{r rborist_top_vars, echo=FALSE}
+get_5_top_important(rborist)
+```
+The 5 most important variables are all geared towards the offensive end of the ball, where it is easier to recognize improvement compared to the defensive end.
+
+Let's see how the Rborist model performs in 1987.
+```{r rborist_1987, echo=FALSE}
+models<-bind_rows(models,eval_table(rborist,"Rborist"))
+models %>% knitr::kable()
+```
+
+The Rborist model has similar RMSE to the ranger model, but higher predicted vote shares. As with ranger, Ellis and Jordan place first and second. Cartwright's case is similar to Jordan as a player who didn't play often in the previous season due to injury.
+
+### Models to Predict 2021 MIP Candidates
+
+We will apply the same models we used for predicting the 2020 winner. We'll continue to evaluate performance using RMSE but now we have 2 test sets: 1986 and 2020.
+```{r lin_2022}
+linear_2022<-train(share_next_seas~.,data=full_data %>%
+                select(-c(seas_id,season,player_id,player)),method="lm",
+              trControl=trainControl(method="cv",number=10,p=0.9))
+```
+Let's get the top 5 most important variables according to the linear model.
+```{r top_lin_vars_2021, echo=FALSE}
+get_5_top_important(linear_2022)
+```
+Age is by far the most important variable, which makes sense. Only two players over the age of 28 have won MIP. The next four variable importances are a drastic drop.
+
+```{r eval_table_2022,include=FALSE}
+eval_table_2022<-function(model,model_name){
+  resid_mean_sq_e<-min(model$results[["RMSE"]])
+  eval_1986_cleaned=eval_1986 %>%
+    select(-c(seas_id,season,player_id,player))
+  eval_1986_predictions=eval_1986 %>% 
+    bind_cols(.,prediction=predict(model,eval_1986_cleaned)) %>%
+    select(seas_id:experience,prediction) %>% arrange(desc(prediction))
+  eval_2020_cleaned=eval_2020 %>%
+    select(-c(seas_id,season,player_id,player))
+  eval_2020_predictions=eval_2020 %>% 
+    bind_cols(.,prediction=predict(model,eval_2020_cleaned)) %>%
+    select(seas_id:experience,prediction) %>% arrange(desc(prediction))
+  results_tib=tibble(Method=model_name,
+                     RMSE=resid_mean_sq_e,
+                     "1987 Top Candidates"=eval_1986_predictions %>%
+                       slice_max(prediction,n=3) %>% pull(player),
+                     "1987 Vote Shares"=eval_1986_predictions %>%
+                       slice_max(prediction,n=3) %>% pull(prediction),
+                     "2021 Top Candidates"=eval_2020_predictions %>%
+                       slice_max(prediction,n=3) %>% pull(player),
+                     "2021 Vote Shares"=eval_2020_predictions %>%
+                       slice_max(prediction,n=3) %>% pull(prediction))
+  return(results_tib)
+}
+```
+```{r linear_1986_2021,echo=FALSE}
+models=eval_table_2022(linear_2022,"Linear")
+models %>% knitr::kable()
+```
+
+The predicted vote shares are extremely low. Robertson and Barkley finished 1st and 2nd in 1986's MIP voting and an MIP has never won the award twice. Stockton's underlying stats primed him for a breakout, but it wasn't until 1988 that he started the majority of games for the Utah Jazz and received MIP votes. This will be a recurring caveat, since we can't predict opportunity/playing time.
+
+```{r knn_2022}
+knn_2022<-train(share_next_seas~.,data=full_data %>%
+                select(-c(seas_id,season,player_id,player)),method="knn",
+                tuneGrid=data.frame(k=seq(5,50)),
+              trControl=trainControl(method="cv",number=10,p=0.9))
+knn_2022$finalModel
+```
+Let's see how the knn model performs in 1986 and 2019.
+```{r knn_1986_2021,echo=FALSE}
+models=bind_rows(models,eval_table_2022(knn_2022,"KNN"))
+models %>% knitr::kable()
+```
+
+The RMSE is marginally higher compared to the linear, but the predicted vote shares are also higher. Daye was already receiving only 16 minutes a game in 1986 and that dropped to 11.8 in 1987. He was out of the league after 1988. Scott was already a solid piece on the 1986 Lakers, averaging 28.8 minutes per game and 15.4 points per game. He got a 5 minute-per-game increase while also upping his 3-point percentage by 7 and his win shares by 2.5. The thing is, Scott's 1987 was very similar to his 1985, so it wasn't really an improvement but more so a recovery from the down year that was 1986. Thompson received less minutes and became less efficient.
