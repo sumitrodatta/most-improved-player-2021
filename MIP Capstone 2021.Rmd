@@ -6,7 +6,8 @@ output: pdf_document
 ---
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE,
+knitr::opts_chunk$set(cache = TRUE,
+                      echo = TRUE,
                       warning = FALSE,
                       message = FALSE)
 ```
@@ -97,7 +98,7 @@ There are three comma-separated value files of player statistics:
 * Advanced contains advanced stats
     + for more information, refer to this [*Basketball-Reference glossary*](https://www.basketball-reference.com/about/glossary.html)
     
-The above three files will be combined into one dataframe with seasons prior to 1984-1985 (which is one season before the inaugural awarding of the MIP award) removed.
+The above three files will be combined into one dataframe with seasons prior to 1984-1985 (which is one season before the inaugural awarding of the MIP award) removed. For players that played for multiple teams in one season, the partial seasons will be discarded. The shooting percentage columns will by multiplied by 100 to remain consistent with the other percent columns.
 
 ```{r load_stats_csvs,results='hide'}
 #specify columns because otherwise birth year is read as logical
@@ -113,7 +114,12 @@ cols_for_stats=cols(
 advanced=read_csv("Data/Advanced.csv",col_types = cols_for_stats)
 per_poss=read_csv("Data/Per 100 Poss.csv",col_types = cols_for_stats)
 per_game=read_csv("Data/Player Per Game.csv",col_types = cols_for_stats)
-combined=left_join(per_game,per_poss) %>% left_join(.,advanced) %>% filter(season > 1984)
+combined=left_join(per_game,per_poss) %>% left_join(.,advanced) %>% filter(season > 1984) %>%
+  mutate(tm=ifelse(tm=="TOT","1TOT",tm)) %>% 
+  group_by(player_id,season) %>% arrange(tm) %>% slice(1) %>% 
+  mutate(tm=ifelse(tm=="1TOT","TOT",tm)) %>% arrange(season,player) %>%
+  mutate(across(c(fg_percent,x3p_percent,x2p_percent,e_fg_percent,ft_percent,ts_percent),
+                ~.*100))
 ```
 
 The other file that will be loaded is the Player Award Shares comma-separated values file. This file keeps track of both the number of first-place votes and the share of an award that a player received. Share equals the amount of points received divided by the maximum number of points possible. The file has multiple awards so it will be filtered for only MIP results. Up to the 2002 season, MIP voters were given one vote, and the player with the highest number of votes won the award. Starting in 2003, a point system was introduced, where:
@@ -162,8 +168,8 @@ The above NA's can all be converted to zeroes.
 stats_and_share[is.na(stats_and_share)]<-0
 ```
 
-```{r clean_environ,echo=FALSE}
-rm(advanced,per_game,per_poss,mip_share,combined)
+```{r clean_environ,include=FALSE}
+rm(advanced,per_game,per_poss,mip_share,combined,cols_for_stats)
 ```
 
 ## Data Exploration and Visualizations
@@ -258,3 +264,162 @@ knitr::include_graphics("Images/Vote Share of MIP Winners.png")
 ```
 
 Looks like the average jumps up significantly after the voting system was changed. In recent years, there's been more consensus.
+
+```{r remove_plots_and_related,include=FALSE}
+rm(mip_stats,mip_winners,ppg_mip,ws_mip,experience_over_time,share_over_time,
+   befo_2003_avg,after_2003_avg)
+```
+
+## Preprocessing
+
+Before we fit our model, we should do some pre-processing. We've already done some pre-processing by handling missing values. 
+
+For the 2021 award winner, we realize that players must have at least one prior season played in order to garner consideration. So we will subset out all players who have only one season played in the database. Removing one-season players has the unfortunate side effect on removing some players who played their last games in 1985, but had a career before then. This shouldn't be too worrisome, as no MIP has won in their final season in the league.
+
+In addition, statistical jumps from the previous season play a much bigger part than the current season's statistics in determining the winner. A player going from 20 points per game to 21 points per game will not merit as much campaigning as a player going from 8 PPG to 18 PPG.
+
+Finally, we will also remove some extraneous information from the data because we don't want to predict based off of a player's team or position.
+
+```{r one_seasoners_and_jumps}
+one_seasoners<-stats_and_share %>% group_by (player_id) %>% 
+  mutate(n=n_distinct(season)) %>% filter(n==1) %>% select(seas_id,player_id,player)
+full_jumps_data<-stats_and_share %>% 
+  #remove the one-season players
+  filter(!(seas_id %in% one_seasoners$seas_id)) %>%
+  group_by(player_id) %>% 
+  #arrange seasons from first to last within each player
+  arrange(season,.by_group=TRUE) %>%
+  #subtract prior season from current season
+  mutate_at(.vars=c(colnames(stats_and_share[12:76])),
+            .funs=funs(`diff`=.-lag(.,default=first(.)))) %>%
+  #do not keep the raw stats, only differences
+  select(seas_id:tm, g_diff:pts_per_game_diff,fg_per_100_poss_diff:vorp_diff,share) %>% 
+  #remove first season from every group (no difference)
+  slice(-1) %>% arrange(seas_id) %>% ungroup() %>% 
+  #do not keep irrelevant information
+  select(seas_id:player,age:experience,g_diff:share)
+```
+
+For predicting candidates in 2022, it's a much more diverse subset. So we'll just remove some of the irrelevant factors from the data.
+
+```{r next_seas_dataframe}
+full_data<-stats_and_share %>% select(seas_id:player,age:experience,g:share_next_seas) %>%
+  select(-c(mp,share))
+```
+
+Now, let's check for variables that are near zero variance.
+```{r near_zero_variance_check}
+nzv<-nearZeroVar(full_jumps_data,saveMetrics = TRUE)
+rownames(nzv)[which(nzv$nzv==TRUE)]
+```
+
+So our outcome column is one of the near-zero variance variables. Interestingly, the 3-point percentage difference is also a near-zero variance column.
+
+```{r season_vs_3_point_diff,echo=FALSE}
+plot(full_jumps_data$season,full_jumps_data$x3p_percent_diff)
+```
+
+```{r nzv_remove, include=FALSE}
+rm(nzv)
+```
+
+## Creating an Evaluation Set
+
+Our evaluation set is straightforward: it is players who have played in the 2021 season. So we segment it off here.
+```{r evaluation_set_2021}
+eval_2021<-full_data %>% filter (season==2021)
+full_data<-full_data %>% filter (season != 2021)
+eval_jumps_2021<-full_jumps_data %>% filter (season == 2021)
+full_jumps_data<-full_jumps_data %>% filter (season != 2021)
+```
+
+As discussed earlier, I could not find any voting records for the 1987 season. All I could find was the winner (Dale Ellis of the Seattle SuperSonics). Instead of removing the 1987 data, I realize that I could use it as a test set or additional performance metric before applying the algorithm to find the 2020 season winner. Ideally, the algorithm would project Ellis to be the winner, and also provide me with the other candidates from that season. In the same vein, I'll remove the 1986 season and 2019 season to predict the 2021 candidates.
+```{r evaluation_1986_and_2020}
+eval_1986<-full_data %>% filter (season==1986)
+eval_2020<-full_data %>% filter (season==2020)
+full_data<-full_data %>% filter(season != 1986 & season != 2020)
+eval_jumps_1987<-full_jumps_data %>% filter (season == 1987)
+full_jumps_data<-full_jumps_data %>% filter (season != 1987)
+```
+
+```{r clean_environ2,include=FALSE}
+rm(stats_and_share,one_seasoners)
+```
+
+## Training Models
+
+### Models to Predict the 2020 Winner
+
+We're not going to create a training set, because the built in train functions can perform cross validation (we'll be using 10 folds). We'll evaluate performance by checking RMSE, the predicted vote share of Dale Ellis in the 1987 test set and the top 3 candidates in 1987. Remember, Ellis won the 1987 MIP but there were no voting records found during research. Five models will be tested. 
+
+A quick note: we'll be excluding the games difference and games started difference (G_diff and GS_diff respectively) as predictors because the NBA has had various fluctuations from the standard 82-game slate:
+
+* the 1999 and 2012 seasons were started late due to lockouts
+* the 2020 and 2021 seasons were condensed due to the COVID-19 pandemic
+
+By including these predictors, we can only lower our estimate.
+
+```{r this_year_linear}
+linear<-train(share~.,data=full_jumps_data %>%
+                select(-c(seas_id,season,player_id,player,g_diff,gs_diff)),method="lm",
+              trControl=trainControl(method="cv",number=10,p=0.9))
+```
+```{r get_important_vars, include=FALSE}
+get_5_top_important<- function(model){
+  ImpMeasure<-data.frame(varImp(model)$importance)
+  ImpMeasure$Vars<-row.names(ImpMeasure)
+  # minus to order descending
+  ImpMeasure[order(-ImpMeasure$Overall),][1:5,]
+}
+```
+
+Let's get the top 5 most important variables of the linear model.
+```{r linear_top_vars, echo=FALSE}
+get_5_top_important(linear)
+```
+
+While 3 of the top 5 variables make sense (minutes per game difference, age & experience), the high importance of turnovers per game difference and personal fouls per game difference is curious. These are stats where a lower amount is considered better.
+
+```{r eval_table,include=FALSE}
+eval_table<-function(model,model_name){
+  resid_mean_sq_e<-min(model$results[["RMSE"]])
+  eval_jumps_1987_cleaned=eval_jumps_1987 %>%
+    select(-c(seas_id,season,player_id,player,g_diff,gs_diff))
+  eval_jumps_1987_predictions=eval_jumps_1987 %>% 
+    bind_cols(.,prediction=predict(model,eval_jumps_1987_cleaned)) %>%
+    select(seas_id:experience,prediction) %>% arrange(desc(prediction))
+  results_tib=tibble(Method=model_name,
+                     RMSE=resid_mean_sq_e,
+                     "Ellis Vote Share"=eval_jumps_1987_predictions %>% 
+                       filter(player=="Dale Ellis") %>% pull(prediction),
+                     "Top 3 Candidates"=eval_jumps_1987_predictions %>%
+                       slice_max(prediction,n=3) %>% pull(player),
+                     "Top 3 Vote Shares"=eval_jumps_1987_predictions %>%
+                       slice_max(prediction,n=3) %>% pull(prediction))
+  return(results_tib)
+}
+```
+
+```{r linear_1987,echo=FALSE}
+models=eval_table(linear,"Linear")
+models %>% knitr::kable()
+```
+
+The vote shares are quite low. Ellis places second behind Michael Jordan. This is somewhat misleading, because Jordan broke his foot the previous year and missed 64 games. He came back with a vengeance, upping his points per game by 14.4. But Jordan was already a star, and stars are implicitly excluded from winning MIP. Thorpe is a worthy candidate: he increased his scoring by nine points and WS/48 by 0.04 while decreasing his turnover percentage.
+
+Next up is the k-nearest neighbors model. The intuition behind using this model is that maybe Most Improved Player winners are most similar to other winners. We can tune the parameter k to change how many neighbors to compare to. We check values of k from 5 to 50.
+
+```{r this_year_knn}
+knn<-train(share~.,data=full_jumps_data %>%
+                select(-c(seas_id,season,player_id,player,g_diff,gs_diff)),method="knn", 
+           tuneGrid=data.frame(k=seq(5,50)),
+           trControl=trainControl(method="cv",number=10,p=0.9))
+knn$finalModel
+```
+
+```{r knn_1987, echo=FALSE}
+models<-bind_rows(models,eval_table(knn,"KNN"))
+models %>% knitr::kable()
+```
+
+The RMSE has improved and the probabilities have grown. The highest share in the linear model is lower than the 3rd highest share in the knn model. KNN predicts Dale Ellis as the winner. We've already discussed the shortcomings of modelling in regards to Jordan's 1987 season. Cage increased his points per game by nine and upped his shooting percentage by 4% while cutting down his fouling rate.
