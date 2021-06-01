@@ -124,7 +124,7 @@ combined=left_join(per_game,per_poss) %>% left_join(.,advanced) %>% filter(seaso
                 ~.*100))
 ```
 
-The other file that will be loaded is the Player Award Shares comma-separated values file. This file keeps track of both the number of first-place votes and the share of an award that a player received. Share equals the amount of points received divided by the maximum number of points possible. The file has multiple awards so it will be filtered for only MIP results. Up to the 2002 season, MIP voters were given one vote, and the player with the highest number of votes won the award. Starting in 2003, a point system was introduced, where:
+Anotther file that will be loaded is the Player Award Shares comma-separated values file. This file keeps track of both the number of first-place votes and the share of an award that a player received. Share equals the amount of points received divided by the maximum number of points possible. The file has multiple awards so it will be filtered for only MIP results. Up to the 2002 season, MIP voters were given one vote, and the player with the highest number of votes won the award. Starting in 2003, a point system was introduced, where:
 
 * a first-place vote equals five points
 * a second-place vote equals three points
@@ -151,9 +151,19 @@ stats_and_share=left_join(combined,mip_share) %>% group_by(player_id) %>% arrang
   mutate(share_next_seas=lead(share)) %>% ungroup()
 ```
 
+The last file that will be loaded is the All-Star Selections comma-separated values file. I noticed last year that established players were factoring into my models more than I'd like. These players were under-performing due to injury and returning to their regular star level a year later. The number of All-Star selections a player has had prior to the current season can act as a proxy to a player's regular talent level.
+
+```{r load_all_star,results='hide'}
+all_stars=read_csv("Data/All-Star Selections.csv") %>% mutate(is_allstar=1) %>%
+  arrange(season,player) %>% group_by(player) %>% 
+  # subtract 1 to remove current season
+  mutate(num_allstars_before_seas=cumsum(is_allstar)-1) %>% ungroup() %>% 
+  select(-c(team,replaced,hof))
+final_data=left_join(stats_and_share,all_stars)
+```
 Let's see if there is any missing data.
 ```{r see_missing}
-colSums(is.na(stats_and_share))
+colSums(is.na(final_data))
 ```
 
 Looks like there's a significant amount of missing data, but it can be broken down into bite-size parts:
@@ -161,29 +171,31 @@ Looks like there's a significant amount of missing data, but it can be broken do
 * the NA's in the shooting percentages are due to a lack of attempts
 * the consistent 5 NA's in the per-100-possessions and advanced stats are due to a lack of data, as those 5 players played less than a minute of game time
   + the rest of the NA's in per-100-possessions & advanced can also be attributed to a lack of data, but rather than minutes played, it is the absence of the stat itself
-* all the players who never received an MIP vote have an NA
+* all the players who never received an MIP vote and were never an all-star have NA's
 * all the players who don't need a birth year to separate them from another player with the same name also have an NA
 
 The above NA's can all be converted to zeroes.
 
 ```{r remove_missing}
-stats_and_share[is.na(stats_and_share)]<-0
+final_data[is.na(final_data)]<-0
 ```
 
 ```{r clean_environ,include=FALSE}
-rm(advanced,per_game,per_poss,mip_share,combined,cols_for_stats)
+rm(advanced,per_game,per_poss,
+   mip_share,combined,cols_for_stats,stats_and_share,all_stars)
 ```
 
 ## Data Exploration and Visualizations
 
 We'll start by seeing how much vote share MIP award winners have received.
 ```{r mip_winner_shares, echo=FALSE}
-mip_winners<-stats_and_share %>% filter(season!=1987) %>% group_by(season) %>% 
+mip_winners<-final_data %>% filter(season!=1987) %>% group_by(season) %>% 
   #get player names and season IDs from indexes
   summarize(player=player[which.max(share)],
             seas_id=seas_id[which.max(share)],
             share=max(share))
-dale_ellis<-stats_and_share %>% filter(season==1987,player=="Dale Ellis") %>% select(season,player,seas_id,share)
+dale_ellis<-final_data %>% filter(season==1987,player=="Dale Ellis") %>%
+  select(season,player,seas_id,share)
 mip_winners <- bind_rows(mip_winners,dale_ellis) %>% arrange(season)
 rm(dale_ellis)
 kable(mip_winners[,c(1:2,4)],booktabs=TRUE) %>% kable_styling(position="center")
@@ -198,8 +210,7 @@ Secondly, we'll plot the scoring per game of the MIP winners. The three missing 
 # take out missing seasons
 mip_winners <- mip_winners %>% filter (!(season %in% c(1985,2021)))
 #remove repeated columns
-mip_stats <- left_join(mip_winners,stats_and_share) %>% 
-  select(-c(share_next_seas))
+mip_stats <- left_join(mip_winners,final_data)
 ppg_mip <- mip_stats %>%
   #minus in fill so more intense correlates to higher points
   ggplot(aes(x=season,y=pts_per_game,fill=-pts_per_game)) + 
@@ -283,29 +294,30 @@ In addition, statistical jumps from the previous season play a much bigger part 
 Finally, we will also remove some extraneous information from the data because we don't want to predict based off of a player's team or position.
 
 ```{r one_seasoners_and_jumps}
-one_seasoners<-stats_and_share %>% group_by (player_id) %>% 
+one_seasoners<-final_data %>% group_by (player_id) %>% 
   mutate(n=n_distinct(season)) %>% filter(n==1) %>% select(seas_id,player_id,player)
-full_jumps_data<-stats_and_share %>% 
+full_jumps_data<-final_data %>% 
   #remove the one-season players
   filter(!(seas_id %in% one_seasoners$seas_id)) %>%
   group_by(player_id) %>% 
   #arrange seasons from first to last within each player
   arrange(season,.by_group=TRUE) %>%
   #subtract prior season from current season
-  mutate_at(.vars=c(colnames(stats_and_share[12:76])),
+  mutate_at(.vars=c(colnames(final_data[12:76])),
             .funs=funs(`diff`=.-lag(.,default=first(.)))) %>%
   #do not keep the raw stats, only differences
-  select(seas_id:tm, g_diff:pts_per_game_diff,fg_per_100_poss_diff:vorp_diff,share) %>% 
+  select(seas_id:tm, g_diff:pts_per_game_diff,fg_per_100_poss_diff:vorp_diff,
+         share,is_allstar,num_allstars_before_seas) %>% 
   #remove first season from every group (no difference)
   slice(-1) %>% arrange(seas_id) %>% ungroup() %>% 
   #do not keep irrelevant information
-  select(seas_id:player,age:experience,g_diff:share)
+  select(seas_id:player,age:experience,g_diff:num_allstars_before_seas)
 ```
 
 For predicting candidates in 2022, it's a much more diverse subset. So we'll just remove some of the irrelevant factors from the data.
 
 ```{r next_seas_dataframe}
-full_data<-stats_and_share %>% select(seas_id:player,age:experience,g:share_next_seas) %>%
+full_data<-final_data %>% select(seas_id:player,age:experience,g:num_allstars_before_seas) %>%
   select(-c(mp,share))
 ```
 
@@ -315,7 +327,7 @@ nzv<-nearZeroVar(full_jumps_data,saveMetrics = TRUE)
 rownames(nzv)[which(nzv$nzv==TRUE)]
 ```
 
-So our outcome column is one of the near-zero variance variables. Interestingly, the 3-point percentage difference is also a near-zero variance column.
+So our outcome column is one of the near-zero variance variables. The number of all-star selections also is near zero variance because anywhere from 20-30 players in a given season are named all-stars out of a total of 200-500 players. Interestingly, the 3-point percentage difference is also a near-zero variance column.
 
 ```{r season_vs_3_point_diff,echo=FALSE}
 plot(full_jumps_data$season,full_jumps_data$x3p_percent_diff)
@@ -335,7 +347,6 @@ eval_jumps_2021<-full_jumps_data %>% filter (season == 2021)
 full_jumps_data<-full_jumps_data %>% filter (season != 2021)
 ```
 
-As discussed earlier, I could not find any voting records for the 1987 season. All I could find was the winner (Dale Ellis of the Seattle SuperSonics). Instead of removing the 1987 data, I realize that I could use it as a test set or additional performance metric before applying the algorithm to find the 2020 season winner. Ideally, the algorithm would project Ellis to be the winner, and also provide me with the other candidates from that season. In the same vein, I'll remove the 1986 season and 2020 season to predict the 2021 candidates.
 As discussed earlier, I could not find any voting records for the 1987 season. All I could find was the winner (Dale Ellis of the Seattle SuperSonics). Instead of removing the 1987 data, I realize that I could use it as a test set or additional performance metric before applying the algorithm to find the 2020 season winner. Ideally, the algorithm would project Ellis to be the winner, and also provide me with the other candidates from that season. In the same vein, I'll cast the 1986 season and 2020 season as test sets in the journey to predict the 2021 candidates. By moving the test sets to the bottom of their respective datasets, I can use the `initial_time_split` function from tidymodels to segment them out.
 
 ```{r test_sets}
