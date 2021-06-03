@@ -56,8 +56,11 @@ Let's start by loading required packages.
 ```{r load_pkgs, results="hide"}
 if(!require(tidyverse)) 
   install.packages("tidyverse", repos = "http://cran.us.r-project.org")
-if(!require(caret)) 
-  install.packages("caret", repos = "http://cran.us.r-project.org")
+if(!require(tidymodels)) 
+  install.packages("tidymodels", repos = "http://cran.us.r-project.org")
+#for variable importance
+if(!require(vip)) 
+  install.packages("vip", repos = "http://cran.us.r-project.org")
 #Rborist and ranger are random forest algorithm wrappers
 if(!require(Rborist)) 
   install.packages("Rborist", repos = "http://cran.us.r-project.org")
@@ -100,7 +103,11 @@ There are three comma-separated value files of player statistics:
 * Advanced contains advanced stats
     + for more information, refer to this [*Basketball-Reference glossary*](https://www.basketball-reference.com/about/glossary.html)
     
-The above three files will be combined into one dataframe with seasons prior to 1984-1985 (which is one season before the inaugural awarding of the MIP award) removed. For players that played for multiple teams in one season, the partial seasons will be discarded. The shooting percentage columns will by multiplied by 100 to remain consistent with the other percent columns.
+The above three files will be combined into one dataframe. For players that played for multiple teams in one season, the partial seasons will be discarded. The shooting percentage columns will by multiplied by 100 to remain consistent with the other percent columns. Lastly, we will take out columns that are the result of linear combinations of other columns:
+
+* field goals made are the sum of 2-point field goals made & 3-point field goals made, similarly with attempts
+* total rebounds are the sum of defensive rebounds & offensive rebounds
+* win shares & box plus-minus, two holistic advanced statistics, are the sum of their offensive & defensive components
 
 ```{r load_stats_csvs,results='hide'}
 #specify columns because otherwise birth year is read as logical
@@ -116,12 +123,13 @@ cols_for_stats=cols(
 advanced=read_csv("Data/Advanced.csv",col_types = cols_for_stats)
 per_poss=read_csv("Data/Per 100 Poss.csv",col_types = cols_for_stats)
 per_game=read_csv("Data/Player Per Game.csv",col_types = cols_for_stats)
-combined=left_join(per_game,per_poss) %>% left_join(.,advanced) %>% filter(season > 1984) %>%
+combined=left_join(per_game,per_poss) %>% left_join(.,advanced) %>%
   mutate(tm=ifelse(tm=="TOT","1TOT",tm)) %>% 
   group_by(player_id,season) %>% arrange(tm) %>% slice(1) %>% 
   mutate(tm=ifelse(tm=="1TOT","TOT",tm)) %>% arrange(season,player) %>%
   mutate(across(c(fg_percent,x3p_percent,x2p_percent,e_fg_percent,ft_percent,ts_percent),
-                ~.*100))
+                ~.*100)) %>%
+  select(-c(starts_with("fg_per_"),starts_with("fga_per_"),starts_with("trb_per_"),ws,bpm))
 ```
 
 Anotther file that will be loaded is the Player Award Shares comma-separated values file. This file keeps track of both the number of first-place votes and the share of an award that a player received. Share equals the amount of points received divided by the maximum number of points possible. The file has multiple awards so it will be filtered for only MIP results. Up to the 2002 season, MIP voters were given one vote, and the player with the highest number of votes won the award. Starting in 2003, a point system was introduced, where:
@@ -151,15 +159,24 @@ stats_and_share=left_join(combined,mip_share) %>% group_by(player_id) %>% arrang
   mutate(share_next_seas=lead(share)) %>% ungroup()
 ```
 
-The last file that will be loaded is the All-Star Selections comma-separated values file. I noticed last year that established players were factoring into my models more than I'd like. These players were under-performing due to injury and returning to their regular star level a year later. The number of All-Star selections a player has had prior to the current season can act as a proxy to a player's regular talent level.
+The last file that will be loaded is the All-Star Selections comma-separated values file. I noticed last year that established players were factoring into my models more than I'd like. These players were under-performing due to injury and returning to their regular star level a year later. The number of All-Star selections a player has had prior to the current season can act as a proxy to a player's regular talent level. After joining the All-Star data with the statistics and vote share data, our last transformation is to remove seasons prior to 1984-1985 (which is one season before the inaugural awarding of the MIP award).
 
 ```{r load_all_star,results='hide'}
 all_stars=read_csv("Data/All-Star Selections.csv") %>% mutate(is_allstar=1) %>%
   arrange(season,player) %>% group_by(player) %>% 
-  # subtract 1 to remove current season
-  mutate(num_allstars_before_seas=cumsum(is_allstar)-1) %>% ungroup() %>% 
-  select(-c(team,replaced,hof))
-final_data=left_join(stats_and_share,all_stars)
+  mutate(num_allstars_inclu_seas=cumsum(is_allstar)) %>% ungroup() %>% 
+  select(-c(team,replaced,hof,is_allstar))
+final_data=left_join(stats_and_share,all_stars) %>% group_by(player_id) %>%
+  #move all-star appearance to next season
+  mutate(all_stars_lag=ifelse(!is.na(lag(num_allstars_inclu_seas)),
+                               lag(num_allstars_inclu_seas),NA)) %>%
+  #add zero for easier filling of NA's
+  mutate(all_stars_tot=ifelse(lead(all_stars_lag)==1,0,NA)) %>%
+  #combine two previous columns
+  mutate(num_allstars_before_seas=coalesce(all_stars_lag,all_stars_tot)) %>%
+  fill(num_allstars_before_seas,.direction="downup") %>% ungroup() %>%
+  filter(season > 1984) %>%
+  select(-c(all_stars_lag,all_stars_tot,num_allstars_inclu_seas))
 ```
 Let's see if there is any missing data.
 ```{r see_missing}
@@ -303,11 +320,11 @@ full_jumps_data<-final_data %>%
   #arrange seasons from first to last within each player
   arrange(season,.by_group=TRUE) %>%
   #subtract prior season from current season
-  mutate_at(.vars=c(colnames(final_data[12:76])),
+  mutate_at(.vars=c(colnames(final_data[12:68])),
             .funs=funs(`diff`=.-lag(.,default=first(.)))) %>%
   #do not keep the raw stats, only differences
-  select(seas_id:tm, g_diff:pts_per_game_diff,fg_per_100_poss_diff:vorp_diff,
-         share,is_allstar,num_allstars_before_seas) %>% 
+  select(seas_id:tm, g_diff:pts_per_game_diff,x3p_per_100_poss_diff:vorp_diff,
+         share,num_allstars_before_seas) %>% 
   #remove first season from every group (no difference)
   slice(-1) %>% arrange(seas_id) %>% ungroup() %>% 
   #do not keep irrelevant information
@@ -319,22 +336,6 @@ For predicting candidates in 2022, it's a much more diverse subset. So we'll jus
 ```{r next_seas_dataframe}
 full_data<-final_data %>% select(seas_id:player,age:experience,g:num_allstars_before_seas) %>%
   select(-c(mp,share))
-```
-
-Now, let's check for variables that are near zero variance.
-```{r near_zero_variance_check}
-nzv<-nearZeroVar(full_jumps_data,saveMetrics = TRUE)
-rownames(nzv)[which(nzv$nzv==TRUE)]
-```
-
-So our outcome column is one of the near-zero variance variables. The number of all-star selections also is near zero variance because anywhere from 20-30 players in a given season are named all-stars out of a total of 200-500 players. Interestingly, the 3-point percentage difference is also a near-zero variance column.
-
-```{r season_vs_3_point_diff,echo=FALSE}
-plot(full_jumps_data$season,full_jumps_data$x3p_percent_diff)
-```
-
-```{r nzv_remove, include=FALSE}
-rm(nzv)
 ```
 
 ## Creating an Evaluation Set
@@ -379,4 +380,52 @@ rm(stats_and_share,one_seasoners,
 
 ## Training Models
 
-### Models to Predict the 2020 Winner
+### Models to Predict the 2021 Winner
+
+With caret, everything could be thrown into the train function: cross-validation, tuning, data, etc. Tidymodels is more explicit in its steps. We'll start off with common steps across all models. The standard 10-fold cross validation is how the data is going to be resampled. Recipes is tidymodels' pre-processing package. The last pre-processing step is to remove the rest of the identifying information. We kept them initially so that it's easier to match predictions to players. We'll also be excluding the games difference and games started difference (g_diff and gs_diff respectively) as predictors because the NBA has had various fluctuations from the standard 82-game slate:
+  
+* the 1999 and 2012 seasons were started late due to lockouts
+* the 2020 and 2021 seasons were condensed due to the COVID-19 pandemic
+
+By including these predictors, we can only lower our estimate.
+
+```{r common_2021_steps}
+this_year_cv=vfold_cv(jumps_trainer,v=10)
+this_year_recipe<-recipe(share ~ .,data=full_jumps_split) %>%
+  step_rm(c(seas_id:player,g_diff,gs_diff))
+```
+
+Our first model is a simple linear regression, which will serve as a baseline.
+```{r this_year_linear}
+lin_model<-linear_reg() %>% set_engine("lm") %>% set_mode("regression")
+this_year_workflow<-workflow() %>% add_recipe(this_year_recipe) %>%
+  add_model(lin_model)
+tuning<-this_year_workflow %>% 
+  tune_grid(resamples=this_year_cv,metrics=metric_set(rmse))
+this_year_workflow <-this_year_workflow %>% 
+  finalize_workflow(tuning %>%select_best(metric="rmse"))
+linear_this_yr=fit(this_year_workflow,jumps_trainer)
+```
+Let's get the most important variables of the linear model.
+```{r linear_top_vars,echo=FALSE}
+vip(pull_workflow_fit(linear_this_yr),scale=TRUE)
+```
+The most important variable is the difference in minutes per game. As a player gets more time on the court, there's more opportunity to rack up positive stats like rebounds and assists but also negative stats like personal fouls and turnovers. The new experience variable checks in as the 7th-most important variable in the linear variable, and the rate & total versions of win shares round out the top 10.
+
+We'll evaluate performance by checking RMSE, the predicted vote share of Dale Ellis in the 1987 test set and the top 3 candidates in 1987. Remember, Ellis won the 1987 MIP but there were no voting records found during research.
+
+```{r linear_1987}
+resid_mean_sq_err=tuning %>% collect_metrics() %>% pull(mean)
+pred_1987=bind_cols(jumps_tester %>% select(seas_id:experience),
+               predict(linear_this_yr,new_data=jumps_tester)) %>% arrange(desc(.pred))
+results_tib=tibble(Method="Linear",
+                     RMSE=resid_mean_sq_err,
+                     "Ellis Vote Share"=pred_1987 %>% 
+                       filter(player=="Dale Ellis") %>% pull(.pred),
+                     "Top 3 Candidates"=pred_1987 %>%
+                       slice_max(.pred,n=3) %>% pull(player),
+                     "Top 3 Vote Shares"=pred_1987 %>%
+                       slice_max(.pred,n=3) %>% pull(.pred))
+results_tib %>% knitr::kable()
+```
+The vote shares are quite low. Ellis places second behind Michael Jordan. This is somewhat misleading, because Jordan broke his foot the previous year and missed 64 games. He came back with a vengeance, upping his points per game by 14.4. But Jordan was already a star, and stars are implicitly excluded from winning MIP. I'd hoped that including the number of All-Star selections prior to the current season would alleviate this problem, but it wasn't a big factor in the linear model. Thorpe is a worthy candidate: he increased his scoring by nine points and WS/48 by 0.04 while decreasing his turnover percentage.
