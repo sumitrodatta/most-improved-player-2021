@@ -159,24 +159,23 @@ stats_and_share=left_join(combined,mip_share) %>% group_by(player_id) %>% arrang
   mutate(share_next_seas=lead(share)) %>% ungroup()
 ```
 
-The last file that will be loaded is the All-Star Selections comma-separated values file. I noticed last year that established players were factoring into my models more than I'd like. These players were under-performing due to injury and returning to their regular star level a year later. The number of All-Star selections a player has had prior to the current season can act as a proxy to a player's regular talent level. After joining the All-Star data with the statistics and vote share data, our last transformation is to remove seasons prior to 1984-1985 (which is one season before the inaugural awarding of the MIP award).
+The last file that will be loaded is the All-Star Selections comma-separated values file. I noticed last year that established players were factoring into my models more than I'd like. These players were under-performing due to injury and returning to their regular star level a year later. I initially thought that the number of All-Star selections a player has had prior to the current season could act as a proxy to a player's regular talent level. However, it might suffice to just determine whether or not a player has ever been an All-Star, effectively turning this into a categorical predictor with only 2 possible values rather than a numeric one with multiple. After joining the All-Star data with the statistics and vote share data, our last transformation is to remove seasons prior to 1984-1985 (which is one season before the inaugural awarding of the MIP award).
 
 ```{r load_all_star,results='hide'}
-all_stars=read_csv("Data/All-Star Selections.csv") %>% mutate(is_allstar=1) %>%
-  arrange(season,player) %>% group_by(player) %>% 
-  mutate(num_allstars_inclu_seas=cumsum(is_allstar)) %>% ungroup() %>% 
-  select(-c(team,replaced,hof,is_allstar))
+all_stars=read_csv("Data/All-Star Selections.csv") %>% group_by(player) %>% 
+  slice_min(season) %>% mutate(first_allstar="Yes") %>% ungroup() %>%
+  select(-c(team,replaced,hof))
 final_data=left_join(stats_and_share,all_stars) %>% group_by(player_id) %>%
   #move all-star appearance to next season
-  mutate(all_stars_lag=ifelse(!is.na(lag(num_allstars_inclu_seas)),
-                               lag(num_allstars_inclu_seas),NA)) %>%
+  mutate(all_stars_lag=lag(first_allstar)) %>%
   #add zero for easier filling of NA's
-  mutate(all_stars_tot=ifelse(lead(all_stars_lag)==1,0,NA)) %>%
+  mutate(all_stars_tot=ifelse(lead(all_stars_lag)=="Yes","No",NA)) %>%
   #combine two previous columns
-  mutate(num_allstars_before_seas=coalesce(all_stars_lag,all_stars_tot)) %>%
-  fill(num_allstars_before_seas,.direction="downup") %>% ungroup() %>%
-  filter(season > 1984) %>%
-  select(-c(all_stars_lag,all_stars_tot,num_allstars_inclu_seas))
+  mutate(been_allstar_before=coalesce(all_stars_lag,all_stars_tot)) %>%
+  fill(been_allstar_before,.direction="downup") %>% 
+  mutate(been_allstar_before=replace_na(been_allstar_before,"No")) %>% 
+  ungroup() %>% filter(season > 1984) %>%
+  select(-c(all_stars_lag,all_stars_tot,first_allstar))
 ```
 Let's see if there is any missing data.
 ```{r see_missing}
@@ -186,9 +185,9 @@ colSums(is.na(final_data))
 Looks like there's a significant amount of missing data, but it can be broken down into bite-size parts:
 
 * the NA's in the shooting percentages are due to a lack of attempts
-* the consistent 5 NA's in the per-100-possessions and advanced stats are due to a lack of data, as those 5 players played less than a minute of game time
+* the consistent 3 NA's in the per-100-possessions and advanced stats are due to a lack of data, as those 3 players played less than a minute of game time
   + the rest of the NA's in per-100-possessions & advanced can also be attributed to a lack of data, but rather than minutes played, it is the absence of the stat itself
-* all the players who never received an MIP vote and were never an all-star have NA's
+* all the players who never received an MIP vote have NA's
 * all the players who don't need a birth year to separate them from another player with the same name also have an NA
 
 The above NA's can all be converted to zeroes.
@@ -324,17 +323,17 @@ full_jumps_data<-final_data %>%
             .funs=funs(`diff`=.-lag(.,default=first(.)))) %>%
   #do not keep the raw stats, only differences
   select(seas_id:tm, g_diff:pts_per_game_diff,x3p_per_100_poss_diff:vorp_diff,
-         share,num_allstars_before_seas) %>% 
+         share,been_allstar_before) %>% 
   #remove first season from every group (no difference)
   slice(-1) %>% arrange(seas_id) %>% ungroup() %>% 
   #do not keep irrelevant information
-  select(seas_id:player,age:experience,g_diff:num_allstars_before_seas)
+  select(seas_id:player,age:experience,g_diff:been_allstar_before)
 ```
 
 For predicting candidates in 2022, it's a much more diverse subset. So we'll just remove some of the irrelevant factors from the data.
 
 ```{r next_seas_dataframe}
-full_data<-final_data %>% select(seas_id:player,age:experience,g:num_allstars_before_seas) %>%
+full_data<-final_data %>% select(seas_id:player,age:experience,g:been_allstar_before) %>%
   select(-c(mp,share))
 ```
 
@@ -382,7 +381,7 @@ rm(stats_and_share,one_seasoners,
 
 ### Models to Predict the 2021 Winner
 
-With caret, everything could be thrown into the train function: cross-validation, tuning, data, etc. Tidymodels is more explicit in its steps. We'll start off with common steps across all models. The standard 10-fold cross validation is how the data is going to be resampled. Recipes is tidymodels' pre-processing package. The last pre-processing step is to remove the rest of the identifying information. We kept them initially so that it's easier to match predictions to players. We'll also be excluding the games difference and games started difference (g_diff and gs_diff respectively) as predictors because the NBA has had various fluctuations from the standard 82-game slate:
+With caret, everything could be thrown into the train function: cross-validation, tuning, data, etc. Tidymodels is more explicit in its steps. We'll start off with common steps across all models. The standard 10-fold cross validation is how the data is going to be resampled. Recipes is tidymodels' pre-processing package. There's two pre-processing steps to perform. The first step is to convert the been_allstar_before column into a numeric column. The second pre-processing step is to remove the rest of the identifying information. We kept them initially so that it's easier to match predictions to players. We'll also be excluding the games difference and games started difference (g_diff and gs_diff respectively) as predictors because the NBA has had various fluctuations from the standard 82-game slate:
   
 * the 1999 and 2012 seasons were started late due to lockouts
 * the 2020 and 2021 seasons were condensed due to the COVID-19 pandemic
@@ -392,14 +391,15 @@ By including these predictors, we can only lower our estimate.
 ```{r common_2021_steps}
 this_year_cv=vfold_cv(jumps_trainer,v=10)
 this_year_recipe<-recipe(share ~ .,data=full_jumps_split) %>%
+  step_dummy(been_allstar_before) %>%
   step_rm(c(seas_id:player,g_diff,gs_diff))
 ```
 
 Our first model is a simple linear regression, which will serve as a baseline.
 ```{r this_year_linear}
-lin_model<-linear_reg() %>% set_engine("lm") %>% set_mode("regression")
+this_year_model<-linear_reg() %>% set_engine("lm") %>% set_mode("regression")
 this_year_workflow<-workflow() %>% add_recipe(this_year_recipe) %>%
-  add_model(lin_model)
+  add_model(this_year_model)
 tuning<-this_year_workflow %>% 
   tune_grid(resamples=this_year_cv,metrics=metric_set(rmse))
 this_year_workflow <-this_year_workflow %>% 
@@ -407,18 +407,21 @@ this_year_workflow <-this_year_workflow %>%
 linear_this_yr=fit(this_year_workflow,jumps_trainer)
 ```
 Let's get the most important variables of the linear model.
+
 ```{r linear_top_vars,echo=FALSE}
 vip(pull_workflow_fit(linear_this_yr),scale=TRUE)
 ```
-The most important variable is the difference in minutes per game. As a player gets more time on the court, there's more opportunity to rack up positive stats like rebounds and assists but also negative stats like personal fouls and turnovers. The new experience variable checks in as the 7th-most important variable in the linear variable, and the rate & total versions of win shares round out the top 10.
+
+The most important variable is the difference in minutes per game. As a player gets more time on the court, there's more opportunity to rack up positive stats like rebounds and assists but also negative stats like personal fouls and turnovers. The new experience variable checks in as the 7th-most important variable in the linear variable, while the rate & total versions of win shares round out the top 10.
 
 We'll evaluate performance by checking RMSE, the predicted vote share of Dale Ellis in the 1987 test set and the top 3 candidates in 1987. Remember, Ellis won the 1987 MIP but there were no voting records found during research.
 
-```{r linear_1987}
-resid_mean_sq_err=tuning %>% collect_metrics() %>% pull(mean)
+```{r eval_table,include=FALSE}
+eval_table<-function(model,model_name){
+resid_mean_sq_err=tuning %>% collect_metrics() %>% pull(mean) %>% min(.)
 pred_1987=bind_cols(jumps_tester %>% select(seas_id:experience),
-               predict(linear_this_yr,new_data=jumps_tester)) %>% arrange(desc(.pred))
-results_tib=tibble(Method="Linear",
+               predict(model,new_data=jumps_tester)) %>% arrange(desc(.pred))
+results_tib=tibble(Method=model_name,
                      RMSE=resid_mean_sq_err,
                      "Ellis Vote Share"=pred_1987 %>% 
                        filter(player=="Dale Ellis") %>% pull(.pred),
@@ -426,6 +429,35 @@ results_tib=tibble(Method="Linear",
                        slice_max(.pred,n=3) %>% pull(player),
                      "Top 3 Vote Shares"=pred_1987 %>%
                        slice_max(.pred,n=3) %>% pull(.pred))
-results_tib %>% knitr::kable()
+return(results_tib)
+}
 ```
-The vote shares are quite low. Ellis places second behind Michael Jordan. This is somewhat misleading, because Jordan broke his foot the previous year and missed 64 games. He came back with a vengeance, upping his points per game by 14.4. But Jordan was already a star, and stars are implicitly excluded from winning MIP. I'd hoped that including the number of All-Star selections prior to the current season would alleviate this problem, but it wasn't a big factor in the linear model. Thorpe is a worthy candidate: he increased his scoring by nine points and WS/48 by 0.04 while decreasing his turnover percentage.
+
+```{r linear_1987,echo=FALSE}
+model_results=eval_table(linear_this_yr,"Linear")
+model_results %>% knitr::kable()
+```
+The vote shares are quite low. Ellis places second behind Michael Jordan. This is somewhat misleading, because Jordan broke his foot the previous year and missed 64 games. He came back with a vengeance, upping his points per game by 14.4. But Jordan was already a star, and stars are implicitly excluded from winning MIP. I'd hoped that including the variable of being an All-Star prior to the current season would alleviate this problem, but it wasn't a big factor in the linear model. Thorpe is a worthy candidate: he increased his scoring by nine points and WS/48 by 0.04 while decreasing his turnover percentage.
+
+Next up is the k-nearest neighbors model. The intuition behind using this model is that maybe Most Improved Player winners are most similar to other winners. We can tune the neighbors parameter to change how many neighbors to compare to. We check values from 5 to 50.
+
+```{r this_year_knn}
+this_year_model<-nearest_neighbor(neighbors = tune()) %>% 
+  set_engine("kknn") %>% set_mode("regression")
+this_year_workflow<-workflow() %>% add_recipe(this_year_recipe) %>%
+  add_model(this_year_model)
+tuning<-this_year_workflow %>% 
+  tune_grid(resamples=this_year_cv,
+            grid=expand.grid(neighbors=5:50),metrics=metric_set(rmse))
+this_year_workflow <-this_year_workflow %>% 
+  finalize_workflow(tuning %>%select_best(metric="rmse"))
+knn_this_yr=fit(this_year_workflow,jumps_trainer)
+tuning %>% select_best(metric="rmse")
+```
+
+Looks like the optimal amount of neighbors is 38.
+```{r knn_1987,echo=FALSE}
+model_results=bind_rows(model_results,eval_table(knn_this_yr,"KNN"))
+model_results %>% knitr::kable()
+```
+The RMSE has improved and the probabilities have grown. The highest share in the linear model is less than half the 3rd highest share in the knn model. KNN predicts Dale Ellis as the winner. We've already discussed the shortcomings of modelling in regards to Jordan's 1987 season, as well as the merit of Thorpe's case.
