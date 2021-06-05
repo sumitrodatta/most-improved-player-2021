@@ -44,7 +44,7 @@ Steps that were performed:
 2. visualizing how MIP winners have performed and how much vote share they received
 3. create a version of the data that shows statistical jumps (current season minus previous season)
 4. separating out evaluation sets (the 2020 season) and test sets (the 1987 season for predicting the 2020 winner, the 1986 and 2019 seasons for predicting 2021 candidates)
-5. training five models: a linear baseline, a k-nearest-neighbors model, two separate random forest models and a support vector machine model
+5. training four models: a linear baseline, a k-nearest-neighbors model, a random forest model and a support vector machine model
 
 Note: to simplify the Season column, I refer to each season by its second half. So you might also hear the current season referred to as the 2020-2021 season.
 
@@ -61,9 +61,7 @@ if(!require(tidymodels))
 #for variable importance
 if(!require(vip)) 
   install.packages("vip", repos = "http://cran.us.r-project.org")
-#Rborist and ranger are random forest algorithm wrappers
-if(!require(Rborist)) 
-  install.packages("Rborist", repos = "http://cran.us.r-project.org")
+#ranger is random forest algorithm wrapper
 if(!require(ranger)) 
   install.packages("ranger", repos = "http://cran.us.r-project.org")
 #matrix stats
@@ -102,8 +100,8 @@ There are three comma-separated value files of player statistics:
     + this is necessary because the late 1990s/early 2000s were notoriously slow, so raw statistics were depressed
 * Advanced contains advanced stats
     + for more information, refer to this [*Basketball-Reference glossary*](https://www.basketball-reference.com/about/glossary.html)
-    
-The above three files will be combined into one dataframe. For players that played for multiple teams in one season, the partial seasons will be discarded. The shooting percentage columns will by multiplied by 100 to remain consistent with the other percent columns. Lastly, we will take out columns that are the result of linear combinations of other columns:
+
+The above three files will be combined into one dataframe. For players that played for multiple teams in one season, the partial seasons will be discarded. The shooting percentage columns will by multiplied by 100 to remain consistent with the other percent columns. In the previous year's project, we removed games played and games started columns as predictors due to various fluctuations in games played between seasons (reasons being contraction, expansion, lockouts, the COVID-19 pandemic, etc). We will convert the games started to a percentage of games played and we will change the games played to a percentage of maximum playable games. This maximum will differ for players who played for multiple teams in one season. Lastly, we will take out columns that are the result of linear combinations of other columns:
 
 * field goals made are the sum of 2-point field goals made & 3-point field goals made, similarly with attempts
 * total rebounds are the sum of defensive rebounds & offensive rebounds
@@ -123,12 +121,21 @@ cols_for_stats=cols(
 advanced=read_csv("Data/Advanced.csv",col_types = cols_for_stats)
 per_poss=read_csv("Data/Per 100 Poss.csv",col_types = cols_for_stats)
 per_game=read_csv("Data/Player Per Game.csv",col_types = cols_for_stats)
-combined=left_join(per_game,per_poss) %>% left_join(.,advanced) %>%
+max_games_tots=per_game %>% filter(tm=="TOT") %>% group_by(season,lg,tm) %>%
+  summarize(max_games_tot=max(g,na.rm = TRUE)) %>% ungroup()
+max_games=per_game %>% filter(tm!="TOT") %>% group_by(season,lg) %>%
+  summarize(max_games_non_tot=max(g,na.rm = TRUE)) %>% ungroup()
+per_game_enhanced=left_join(per_game,max_games_tots) %>% left_join(.,max_games) %>%
+  mutate(max_games_playable=coalesce(max_games_tot,max_games_non_tot)) %>% 
+  select(-c(max_games_non_tot,max_games_tot))
+combined=left_join(per_game_enhanced,per_poss) %>% left_join(.,advanced) %>%
   mutate(tm=ifelse(tm=="TOT","1TOT",tm)) %>% 
   group_by(player_id,season) %>% arrange(tm) %>% slice(1) %>% 
   mutate(tm=ifelse(tm=="1TOT","TOT",tm)) %>% arrange(season,player) %>%
   mutate(across(c(fg_percent,x3p_percent,x2p_percent,e_fg_percent,ft_percent,ts_percent),
                 ~.*100)) %>%
+  mutate(g_percent=g/max_games_playable*100,gs_percent=gs/g*100,.before=g) %>% 
+  select(-c(g,gs,max_games_playable)) %>%
   select(-c(starts_with("fg_per_"),starts_with("fga_per_"),starts_with("trb_per_"),ws,bpm))
 ```
 
@@ -197,7 +204,7 @@ final_data[is.na(final_data)]<-0
 ```
 
 ```{r clean_environ,include=FALSE}
-rm(advanced,per_game,per_poss,
+rm(advanced,per_game,per_poss,per_game_enhanced,max_games,max_games_tots,
    mip_share,combined,cols_for_stats,stats_and_share,all_stars)
 ```
 
@@ -322,18 +329,19 @@ full_jumps_data<-final_data %>%
   mutate_at(.vars=c(colnames(final_data[12:68])),
             .funs=funs(`diff`=.-lag(.,default=first(.)))) %>%
   #do not keep the raw stats, only differences
-  select(seas_id:tm, g_diff:pts_per_game_diff,x3p_per_100_poss_diff:vorp_diff,
+  select(seas_id:tm, g_percent_diff:pts_per_game_diff,x3p_per_100_poss_diff:vorp_diff,
          share,been_allstar_before) %>% 
   #remove first season from every group (no difference)
   slice(-1) %>% arrange(seas_id) %>% ungroup() %>% 
   #do not keep irrelevant information
-  select(seas_id:player,age:experience,g_diff:been_allstar_before)
+  select(seas_id:player,age:experience,g_percent_diff:been_allstar_before)
 ```
 
 For predicting candidates in 2022, it's a much more diverse subset. So we'll just remove some of the irrelevant factors from the data.
 
 ```{r next_seas_dataframe}
-full_data<-final_data %>% select(seas_id:player,age:experience,g:been_allstar_before) %>%
+full_data<-final_data %>% select(seas_id:player,age:experience,
+                                 g_percent:been_allstar_before) %>%
   select(-c(mp,share))
 ```
 
@@ -381,18 +389,13 @@ rm(stats_and_share,one_seasoners,
 
 ### Models to Predict the 2021 Winner
 
-With caret, everything could be thrown into the train function: cross-validation, tuning, data, etc. Tidymodels is more explicit in its steps. We'll start off with common steps across all models. The standard 10-fold cross validation is how the data is going to be resampled. Recipes is tidymodels' pre-processing package. There's two pre-processing steps to perform. The first step is to convert the been_allstar_before column into a numeric column. The second pre-processing step is to remove the rest of the identifying information. We kept them initially so that it's easier to match predictions to players. We'll also be excluding the games difference and games started difference (g_diff and gs_diff respectively) as predictors because the NBA has had various fluctuations from the standard 82-game slate:
-  
-* the 1999 and 2012 seasons were started late due to lockouts
-* the 2020 and 2021 seasons were condensed due to the COVID-19 pandemic
-
-By including these predictors, we can only lower our estimate.
+With caret, everything could be thrown into the train function: cross-validation, tuning, data, etc. Tidymodels is more explicit in its steps. We'll start off with common steps across all models. The standard 10-fold cross validation is how the data is going to be resampled. Recipes is tidymodels' pre-processing package. There's two pre-processing steps to perform. The first step is to convert the been_allstar_before column into a numeric column. The second pre-processing step is to remove the rest of the identifying information. We kept them initially so that it's easier to match predictions to players.
 
 ```{r common_2021_steps}
 this_year_cv=vfold_cv(jumps_trainer,v=10)
 this_year_recipe<-recipe(share ~ .,data=full_jumps_split) %>%
   step_dummy(been_allstar_before) %>%
-  step_rm(c(seas_id:player,g_diff,gs_diff))
+  step_rm(c(seas_id:player))
 ```
 
 Our first model is a simple linear regression, which will serve as a baseline.
@@ -412,7 +415,7 @@ Let's get the most important variables of the linear model.
 vip(pull_workflow_fit(linear_this_yr),scale=TRUE)
 ```
 
-The most important variable is the difference in minutes per game. As a player gets more time on the court, there's more opportunity to rack up positive stats like rebounds and assists but also negative stats like personal fouls and turnovers. The new experience variable checks in as the 7th-most important variable in the linear variable, while the rate & total versions of win shares round out the top 10.
+The most important variable is the difference in minutes per game. As a player gets more time on the court, there's more opportunity to rack up positive stats like rebounds, assists and blocks but also negative stats like personal fouls and turnovers. The new experience variable checks in as the 7th-most important variable in the linear variable. Offensive improvement is easier to recognize than defensive improvement, so it makes sense that we see offensive win shares in the top 10 and not defensive win shares.
 
 We'll evaluate performance by checking RMSE, the predicted vote share of Dale Ellis in the 1987 test set and the top 3 candidates in 1987. Remember, Ellis won the 1987 MIP but there were no voting records found during research.
 
@@ -452,12 +455,51 @@ tuning<-this_year_workflow %>%
 this_year_workflow <-this_year_workflow %>% 
   finalize_workflow(tuning %>%select_best(metric="rmse"))
 knn_this_yr=fit(this_year_workflow,jumps_trainer)
-tuning %>% select_best(metric="rmse")
+tuning %>% select_best(metric="rmse") %>% knitr::kable()
 ```
-
-Looks like the optimal amount of neighbors is 38.
+Looks like the optimal amount of neighbors is 31.
 ```{r knn_1987,echo=FALSE}
 model_results=bind_rows(model_results,eval_table(knn_this_yr,"KNN"))
 model_results %>% knitr::kable()
 ```
 The RMSE has improved and the probabilities have grown. The highest share in the linear model is less than half the 3rd highest share in the knn model. KNN predicts Dale Ellis as the winner. We've already discussed the shortcomings of modelling in regards to Jordan's 1987 season, as well as the merit of Thorpe's case.
+
+The next model is a random forest which return the average of multiple decision trees. The intuition behind using models from the decision tree family is that maybe there are certain statistical thresholds that a potential MIP winner needs to meet in order to merit consideration. As a player passes more of these checkpoints, their vote share increases. Random forests are better than decision trees in that they reduce instability by averaging multiple trees. Unfortunately, the cost is interpretability. There is no tree diagram that is representative of the decisions made. With *random* forest algorithms, we need to set a seed to keep the work reproducible.
+
+Random forest algorithms require an explicit call for variable importance, so we'll ask for permutation importance. A simplified explanation for permutation importance is shuffling a predictor's values and seeing how much the error increases. As a predictor's importance increases, it is difficult for the rest of the model to compute accurate predictions without it. There are 3 tuning parameters:
+
+* trees is the number of decision trees to create
+    + the default is 500, which we'll keep
+* mtry is the number of variables to split at each decision node
+    + the default is the rounded square root of the number of variables, which in this case would be `round(sqrt(59))`
+    + we will try all integers between 5 & 10
+* min_n is the minimum number of observations needed to split a node
+    + the default is 5 for a regression problem like this, which we'll keep
+ 
+```{r this_year_ranger}
+set.seed(20,sample.kind = "Rounding")
+this_year_model<-rand_forest(mtry = tune()) %>% 
+  set_engine("ranger",importance="permutation") %>% set_mode("regression")
+this_year_workflow<-workflow() %>% add_recipe(this_year_recipe) %>%
+  add_model(this_year_model)
+tuning<-this_year_workflow %>% 
+  tune_grid(resamples=this_year_cv,
+            grid=expand.grid(mtry=5:10),metrics=metric_set(rmse))
+this_year_workflow <-this_year_workflow %>% 
+  finalize_workflow(tuning %>%select_best(metric="rmse"))
+ranger_this_yr=fit(this_year_workflow,jumps_trainer)
+tuning %>% select_best(metric="rmse") %>% knitr::kable()
+```
+
+```{r ranger_top_vars,echo=FALSE}
+vip(pull_workflow_fit(ranger_this_yr),scale=TRUE)
+```
+
+The top 5 variables all heed from the per-game subset, with the top 2 in separate tiers of importance from the others.
+
+```{r ranger_1987,echo=FALSE}
+model_results=bind_rows(model_results,eval_table(ranger_this_yr,"Ranger"))
+model_results %>% knitr::kable()
+```
+
+Ellis & Jordan are the top 2 yet again, with Bill Cartwright making an appearance. Cartwright's case is similar to Jordan as a player who didn't play often in the previous season due to injury.
