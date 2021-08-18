@@ -19,7 +19,7 @@ knitr::opts_chunk$set(cache = TRUE,
 For my HarvardX capstone project, I performed an analysis on whether I could predict last year's Most Improved Player and this year's candidates (found here). With the 2020-2021 regular season in the books, I decided to go back and improve on it. Major changes include:
 
 * a more robust dataset (instead of using the IMPORTHTML function on Google Sheets multiple times, I learned how to webscrape)
-* a new variable (experience or seasons played in the league)
+* a couple of new variables (experience or seasons played in the league, and whether the player in question has been an All-Star selection in any prior season)
 * different machine learning models (a decision tree does not lend itself to use with this many granular decimals)
 
 # Introduction
@@ -389,36 +389,6 @@ rm(stats_and_share,one_seasoners,
 
 ### Models to Predict the 2021 Winner
 
-With caret, everything could be thrown into the train function: cross-validation, tuning, data, etc. Tidymodels is more explicit in its steps. We'll start off with common steps across all models. The standard 10-fold cross validation is how the data is going to be resampled. Recipes is tidymodels' pre-processing package. There's two pre-processing steps to perform. The first step is to convert the been_allstar_before column into a numeric column. The second pre-processing step is to remove the rest of the identifying information. We kept them initially so that it's easier to match predictions to players.
-
-```{r common_2021_steps}
-this_year_cv=vfold_cv(jumps_trainer,v=10)
-this_year_recipe<-recipe(share ~ .,data=full_jumps_split) %>%
-  step_dummy(been_allstar_before) %>%
-  step_rm(c(seas_id:player))
-```
-
-Our first model is a simple linear regression, which will serve as a baseline.
-```{r this_year_linear}
-this_year_model<-linear_reg() %>% set_engine("lm") %>% set_mode("regression")
-this_year_workflow<-workflow() %>% add_recipe(this_year_recipe) %>%
-  add_model(this_year_model)
-tuning<-this_year_workflow %>% 
-  tune_grid(resamples=this_year_cv,metrics=metric_set(rmse))
-this_year_workflow <-this_year_workflow %>% 
-  finalize_workflow(tuning %>%select_best(metric="rmse"))
-linear_this_yr=fit(this_year_workflow,jumps_trainer)
-```
-Let's get the most important variables of the linear model.
-
-```{r linear_top_vars,echo=FALSE}
-vip(pull_workflow_fit(linear_this_yr),scale=TRUE)
-```
-
-The most important variable is the difference in minutes per game. As a player gets more time on the court, there's more opportunity to rack up positive stats like rebounds, assists and blocks but also negative stats like personal fouls and turnovers. The new experience variable checks in as the 7th-most important variable in the linear variable. Offensive improvement is easier to recognize than defensive improvement, so it makes sense that we see offensive win shares in the top 10 and not defensive win shares.
-
-We'll evaluate performance by checking RMSE, the predicted vote share of Dale Ellis in the 1987 test set and the top 3 candidates in 1987. Remember, Ellis won the 1987 MIP but there were no voting records found during research.
-
 ```{r eval_table,include=FALSE}
 eval_table<-function(model,model_name){
 resid_mean_sq_err=tuning %>% collect_metrics() %>% pull(mean) %>% min(.)
@@ -436,33 +406,57 @@ return(results_tib)
 }
 ```
 
-```{r linear_1987,echo=FALSE}
-model_results=eval_table(linear_this_yr,"Linear")
-model_results %>% knitr::kable()
+```{r pretty_variable_importance,include=FALSE}
+prettify_vip<-function(model,title){
+  importance_plot = vip(pull_workflow_fit(model),scale=TRUE,
+                        mapping = aes_string(fill = "Variable")) +
+  dark_theme_gray() + theme(legend.position = "none") + ggtitle(title)
+  ggsave(paste0("Images/",title,".png"),plot=importance_plot,
+       width=7.5,height=3.75,units = "in")
+  knitr::include_graphics(paste0("Images/",title,".png"))
+}
 ```
-The vote shares are quite low. Ellis places second behind Michael Jordan. This is somewhat misleading, because Jordan broke his foot the previous year and missed 64 games. He came back with a vengeance, upping his points per game by 14.4. But Jordan was already a star, and stars are implicitly excluded from winning MIP. I'd hoped that including the variable of being an All-Star prior to the current season would alleviate this problem, but it wasn't a big factor in the linear model. Thorpe is a worthy candidate: he increased his scoring by nine points and WS/48 by 0.04 while decreasing his turnover percentage.
+
+With caret, everything could be thrown into the train function: cross-validation, tuning, data, etc. Tidymodels is more explicit in its steps. We'll start off with common steps across all models. The standard 10-fold cross validation is how the data is going to be resampled. Recipes is tidymodels' pre-processing package. There's two pre-processing steps to perform. The first step is to convert the been_allstar_before column into a numeric column. The second pre-processing step is to update the role of the rest of the identifying information so that it's easier to match predictions to players.
+
+```{r common_2021_steps}
+this_year_cv=vfold_cv(jumps_trainer,v=10)
+this_year_recipe<-recipe(share ~ .,data=full_jumps_split) %>%
+  step_dummy(been_allstar_before) %>% 
+  update_role(seas_id:player,new_role="id")
+```
+
+Our first model is a simple linear regression, which will serve as a baseline.
+```{r this_year_linear}
+wf <- workflow() %>% add_recipe(this_year_recipe) %>%
+  add_model(linear_reg() %>% set_engine("lm") %>% set_mode("regression"))
+tune_lin <- wf %>% 
+  tune_grid(resamples=this_year_cv,metrics=metric_set(rmse))
+wf <- wf %>% finalize_workflow(tune_lin %>% select_best(metric="rmse"))
+lin_this_yr=fit(wf,jumps_trainer)
+```
+Let's get the most important variables of the linear model.
+
+```{r linear_top_vars,echo=FALSE}
+prettify_vip(lin_this_yr,"Linear_2021_Prediction Variable Importance")
+```
+
+The most important variable is the difference in minutes per game. As a player gets more time on the court, there's more opportunity to rack up positive stats like rebounds, assists and blocks but also negative stats like personal fouls and turnovers. The new experience variable checks in as the 7th-most important variable in the linear variable. Offensive improvement is easier to recognize than defensive improvement, so it makes sense that we see offensive win shares in the top 10 and not defensive win shares.
 
 Next up is the k-nearest neighbors model. The intuition behind using this model is that maybe Most Improved Player winners are most similar to other winners. We can tune the neighbors parameter to change how many neighbors to compare to. We check values from 5 to 50.
 
 ```{r this_year_knn}
-this_year_model<-nearest_neighbor(neighbors = tune()) %>% 
-  set_engine("kknn") %>% set_mode("regression")
-this_year_workflow<-workflow() %>% add_recipe(this_year_recipe) %>%
-  add_model(this_year_model)
-tuning<-this_year_workflow %>% 
-  tune_grid(resamples=this_year_cv,
-            grid=expand.grid(neighbors=5:50),metrics=metric_set(rmse))
-this_year_workflow <-this_year_workflow %>% 
-  finalize_workflow(tuning %>%select_best(metric="rmse"))
-knn_this_yr=fit(this_year_workflow,jumps_trainer)
-tuning %>% select_best(metric="rmse") %>% knitr::kable()
+wf <- workflow() %>% add_recipe(this_year_recipe) %>%
+  add_model(nearest_neighbor(neighbors = tune()) %>% 
+  set_engine("kknn") %>% set_mode("regression"))
+tune_knn <- wf %>% tune_grid(resamples=this_year_cv,
+                             grid=expand.grid(neighbors=5:50),
+                             metrics=metric_set(rmse))
+wf <- wf %>% finalize_workflow(tuning %>%select_best(metric="rmse"))
+knn_this_yr=fit(wf,jumps_trainer)
+tune_knn %>% select_best(metric="rmse") %>% knitr::kable()
 ```
 Looks like the optimal amount of neighbors is 31.
-```{r knn_1987,echo=FALSE}
-model_results=bind_rows(model_results,eval_table(knn_this_yr,"KNN"))
-model_results %>% knitr::kable()
-```
-The RMSE has improved and the probabilities have grown. The highest share in the linear model is less than half the 3rd highest share in the knn model. KNN predicts Dale Ellis as the winner. We've already discussed the shortcomings of modelling in regards to Jordan's 1987 season, as well as the merit of Thorpe's case.
 
 The next model is a random forest which return the average of multiple decision trees. The intuition behind using models from the decision tree family is that maybe there are certain statistical thresholds that a potential MIP winner needs to meet in order to merit consideration. As a player passes more of these checkpoints, their vote share increases. Random forests are better than decision trees in that they reduce instability by averaging multiple trees. Unfortunately, the cost is interpretability. There is no tree diagram that is representative of the decisions made. With *random* forest algorithms, we need to set a seed to keep the work reproducible.
 
@@ -478,28 +472,29 @@ Random forest algorithms require an explicit call for variable importance, so we
  
 ```{r this_year_ranger}
 set.seed(20,sample.kind = "Rounding")
-this_year_model<-rand_forest(mtry = tune()) %>% 
-  set_engine("ranger",importance="permutation") %>% set_mode("regression")
-this_year_workflow<-workflow() %>% add_recipe(this_year_recipe) %>%
-  add_model(this_year_model)
-tuning<-this_year_workflow %>% 
-  tune_grid(resamples=this_year_cv,
-            grid=expand.grid(mtry=5:10),metrics=metric_set(rmse))
-this_year_workflow <-this_year_workflow %>% 
-  finalize_workflow(tuning %>%select_best(metric="rmse"))
-ranger_this_yr=fit(this_year_workflow,jumps_trainer)
-tuning %>% select_best(metric="rmse") %>% knitr::kable()
+wf<-workflow() %>% add_recipe(this_year_recipe) %>%
+  add_model(rand_forest(mtry = tune()) %>% 
+  set_engine("ranger",importance="permutation") %>% set_mode("regression"))
+tune_forest<-wf %>% tune_grid(resamples=this_year_cv,
+                              grid=expand.grid(mtry=5:10),
+                              metrics=metric_set(rmse))
+wf <-wf %>% finalize_workflow(tune_forest %>% select_best(metric="rmse"))
+ranger_this_yr=fit(wf,jumps_trainer)
+tune_forest %>% select_best(metric="rmse") %>% knitr::kable()
 ```
 
 ```{r ranger_top_vars,echo=FALSE}
-vip(pull_workflow_fit(ranger_this_yr),scale=TRUE)
+prettify_vip(ranger_this_yr,"Ranger_2021_Prediction Variable Importance")
 ```
 
 The top 5 variables all heed from the per-game subset, with the top 2 in separate tiers of importance from the others.
 
-```{r ranger_1987,echo=FALSE}
-model_results=bind_rows(model_results,eval_table(ranger_this_yr,"Ranger"))
+We'll evaluate performance by checking RMSE, the predicted vote share of Dale Ellis in the 1987 test set and the top 3 candidates in 1987. Remember, Ellis won the 1987 MIP but there were no voting records found during research.
+
+```{r this_yr_metrics,echo=FALSE}
+model_results=eval_table(linear_this_yr,"Linear")
+model_results<-bind_rows(model_results,
+                         eval_table(knn_this_yr,"KNN"),
+                         eval_table(ranger_this_yr,"Ranger"))
 model_results %>% knitr::kable()
 ```
-
-Ellis & Jordan are the top 2 yet again, with Bill Cartwright making an appearance. Cartwright's case is similar to Jordan as a player who didn't play often in the previous season due to injury.
