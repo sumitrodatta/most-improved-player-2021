@@ -20,7 +20,7 @@ For my HarvardX capstone project, I performed an analysis on whether I could pre
 
 * a more robust dataset (instead of using the IMPORTHTML function on Google Sheets multiple times, I learned how to webscrape)
 * a couple of new variables (experience or seasons played in the league, and whether the player in question has been an All-Star selection in any prior season)
-* different machine learning models (a decision tree does not lend itself to use with this many granular decimals)
+* different machine learning algorithms (a decision tree does not lend itself to use with this many granular decimals)
 
 # Introduction
 
@@ -390,8 +390,8 @@ rm(stats_and_share,one_seasoners,
 ### Models to Predict the 2021 Winner
 
 ```{r eval_table,include=FALSE}
-eval_table<-function(model,model_name){
-resid_mean_sq_err=tuning %>% collect_metrics() %>% pull(mean) %>% min(.)
+eval_table<-function(model,model_name,tuning_var){
+resid_mean_sq_err=tuning_var %>% collect_metrics() %>% pull(mean) %>% min(.)
 pred_1987=bind_cols(jumps_tester %>% select(seas_id:experience),
                predict(model,new_data=jumps_tester)) %>% arrange(desc(.pred))
 results_tib=tibble(Method=model_name,
@@ -419,7 +419,7 @@ prettify_vip<-function(model,title){
 
 With caret, everything could be thrown into the train function: cross-validation, tuning, data, etc. Tidymodels is more explicit in its steps. We'll start off with common steps across all models. The standard 10-fold cross validation is how the data is going to be resampled. Recipes is tidymodels' pre-processing package. There's two pre-processing steps to perform. The first step is to convert the been_allstar_before column into a numeric column. The second pre-processing step is to update the role of the rest of the identifying information so that it's easier to match predictions to players.
 
-```{r common_2021_steps}
+```{r common_this_year_steps}
 this_year_cv=vfold_cv(jumps_trainer,v=10)
 this_year_recipe<-recipe(share ~ .,data=full_jumps_split) %>%
   step_dummy(been_allstar_before) %>% 
@@ -437,7 +437,7 @@ lin_this_yr=fit(wf,jumps_trainer)
 ```
 Let's get the most important variables of the linear model.
 
-```{r linear_top_vars,echo=FALSE}
+```{r linear_top_vars,echo=FALSE,fig.align='center',out.width="100%"}
 prettify_vip(lin_this_yr,"Linear_2021_Prediction Variable Importance")
 ```
 
@@ -452,11 +452,11 @@ wf <- workflow() %>% add_recipe(this_year_recipe) %>%
 tune_knn <- wf %>% tune_grid(resamples=this_year_cv,
                              grid=expand.grid(neighbors=5:50),
                              metrics=metric_set(rmse))
-wf <- wf %>% finalize_workflow(tuning %>%select_best(metric="rmse"))
+wf <- wf %>% finalize_workflow(tune_knn %>% select_best(metric="rmse"))
 knn_this_yr=fit(wf,jumps_trainer)
 tune_knn %>% select_best(metric="rmse") %>% knitr::kable()
 ```
-Looks like the optimal amount of neighbors is 31.
+Looks like the optimal amount of neighbors is 41.
 
 The next model is a random forest which return the average of multiple decision trees. The intuition behind using models from the decision tree family is that maybe there are certain statistical thresholds that a potential MIP winner needs to meet in order to merit consideration. As a player passes more of these checkpoints, their vote share increases. Random forests are better than decision trees in that they reduce instability by averaging multiple trees. Unfortunately, the cost is interpretability. There is no tree diagram that is representative of the decisions made. With *random* forest algorithms, we need to set a seed to keep the work reproducible.
 
@@ -483,18 +483,96 @@ ranger_this_yr=fit(wf,jumps_trainer)
 tune_forest %>% select_best(metric="rmse") %>% knitr::kable()
 ```
 
-```{r ranger_top_vars,echo=FALSE}
+```{r ranger_top_vars,echo=FALSE,fig.align='center',out.width="100%"}
 prettify_vip(ranger_this_yr,"Ranger_2021_Prediction Variable Importance")
 ```
 
 The top 5 variables all heed from the per-game subset, with the top 2 in separate tiers of importance from the others.
 
+Finally, we train the support vector machine on the model. SVMs attempt to separate classes with a hyperplane. Support vectors are the points closest to the hyperplane, named as such because the hyperplane would change if those points were removed. 
+
+There are two tuning parameters:
+
+* rbf_sigma: determines how well to fit the training data (higher=fit closer to training)
+    + with a high sigma, every workaday big with middling stats might be predicted to get close to Mozgov money
+* cost: tradeoff between smoothness of boundaries and correct classification
+    + with a high cost, leads to too wiggly of a boundary, and might not generalize to test sets
+    + tests using C=0.25, C=0.5 and C=1
+    
+```{r this_year_svm}
+set.seed(100,sample.kind = "Rounding")
+wf <- workflow() %>% add_recipe(this_year_recipe) %>%
+  add_model(svm_rbf(rbf_sigma=tune(),cost=tune()) %>% 
+  set_engine("kernlab") %>% set_mode("regression"))
+tune_svm <- wf %>% tune_grid(resamples=this_year_cv,
+                        grid=expand.grid(rbf_sigma=0.1^seq(2:5),
+                                         cost=c(0.25,0.5,1)),
+                        metrics=metric_set(rmse))
+wf <- wf %>% finalize_workflow(tune_svm %>% select_best(metric="rmse"))
+svm_this_yr=fit(wf,jumps_trainer)
+tune_svm %>% select_best(metric="rmse") %>% knitr::kable()
+```
+Unfortunately, there is no concept of variable importance for an SVM model.
+
 We'll evaluate performance by checking RMSE, the predicted vote share of Dale Ellis in the 1987 test set and the top 3 candidates in 1987. Remember, Ellis won the 1987 MIP but there were no voting records found during research.
 
 ```{r this_yr_metrics,echo=FALSE}
-model_results=eval_table(linear_this_yr,"Linear")
+model_results=eval_table(lin_this_yr,"Linear",tune_lin)
 model_results<-bind_rows(model_results,
-                         eval_table(knn_this_yr,"KNN"),
-                         eval_table(ranger_this_yr,"Ranger"))
+                         eval_table(knn_this_yr,"KNN",tune_knn),
+                         eval_table(ranger_this_yr,"Ranger",tune_forest),
+                         eval_table(svm_this_yr,"SVM",tune_svm))
 model_results %>% knitr::kable()
+```
+The vote shares are quite low, but especially so for both the linear & SVM models. The highest shars in the linear and SVM models are less than half the 3rd highest share in the knn model. Ellis & Michael Jordan are present in all 4 top 3s, while the third candidate varies. In the linear model, Jordan even finishes first. This is somewhat misleading, because Jordan broke his foot the previous year and missed 64 games. He came back with a vengeance, upping his points per game by 14.4. But Jordan was already a star, and stars are implicitly excluded from winning MIP. I'd hoped that including the variable of being an All-Star prior to the current season would alleviate this problem, but it wasn't a big factor in the linear model. 
+
+Thorpe is a worthy candidate: he increased his scoring by nine points and WS/48 by 0.04 while decreasing his turnover percentage. Cartwright's case is similar to Jordan as a player who didn't play often in the previous season due to injury.
+
+### Models to Predict 2022 MIP Candidates
+
+```{r eval_table_next_year,include=FALSE}
+eval_table_next_yr<-function(model,model_name,tuning_var){
+resid_mean_sq_err=tuning_var %>% collect_metrics() %>% pull(mean) %>% min(.)
+pred_1986_2020=bind_cols(tester %>% select(seas_id:experience),
+               predict(model,new_data=tester)) %>% arrange(desc(.pred))
+results_tib=tibble(Method=model_name,
+                   RMSE=resid_mean_sq_err,
+                   "1987 Top Candidates"=pred_1986_2020 %>% 
+                     filter(season==1986) %>%
+                     slice_max(.pred,n=3) %>% pull(player),
+                   "1987 Top Vote Shares"=pred_1986_2020 %>% 
+                     filter(season==1986) %>%
+                     slice_max(.pred,n=3) %>% pull(.pred),
+                   "2021 Top Candidates"=pred_1986_2020 %>% 
+                     filter(season==2020) %>%
+                     slice_max(.pred,n=3) %>% pull(player),
+                   "2021 Top Vote Shares"=pred_1986_2020 %>% 
+                     filter(season==2020) %>%
+                     slice_max(.pred,n=3) %>% pull(.pred))
+return(results_tib)
+}
+```
+
+
+We will apply the same algorithms we used for predicting the 2021 winner. We'll continue to evaluate performance using RMSE but now we have 2 test sets: 1986 and 2020.
+
+```{r common_next_year_steps}
+next_year_cv=vfold_cv(trainer,v=10)
+next_year_recipe<-recipe(share_next_seas ~ .,data=full_split) %>%
+  step_dummy(been_allstar_before) %>% 
+  update_role(seas_id:player,new_role="id")
+```
+
+```{r next_year_linear}
+wf <- workflow() %>% add_recipe(next_year_recipe) %>%
+  add_model(linear_reg() %>% set_engine("lm") %>% set_mode("regression"))
+tune_lin <- wf %>% tune_grid(resamples=next_year_cv,metrics=metric_set(rmse))
+wf <- wf %>% finalize_workflow(tune_lin %>% select_best(metric="rmse"))
+lin_next_yr=fit(wf,trainer)
+```
+
+Let's get the most important variables of the linear model.
+
+```{r linear_nxt_top_vars,echo=FALSE,fig.align='center',out.width="100%"}
+prettify_vip(lin_next_yr,"Linear_2022_Prediction Variable Importance")
 ```
