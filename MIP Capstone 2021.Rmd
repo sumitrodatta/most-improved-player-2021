@@ -314,7 +314,7 @@ For the 2021 award winner, we realize that players must have at least one prior 
 
 In addition, statistical jumps from the previous season play a much bigger part than the current season's statistics in determining the winner. A player going from 20 points per game to 21 points per game will not merit as much campaigning as a player going from 8 PPG to 18 PPG.
 
-Finally, we will also remove some extraneous information from the data because we don't want to predict based off of a player's team or position.
+Finally, we will also remove some extraneous information from the data because we don't want to predict based off of a player's team or position. While age was used as a predictor variable last year, we'll remove it since we have our new experience variable. Experience could also be looked at as "league age" and expected improvement is more closely tied to experience than player age.
 
 ```{r one_seasoners_and_jumps}
 one_seasoners<-final_data %>% group_by (player_id) %>% 
@@ -334,13 +334,13 @@ full_jumps_data<-final_data %>%
   #remove first season from every group (no difference)
   slice(-1) %>% arrange(seas_id) %>% ungroup() %>% 
   #do not keep irrelevant information
-  select(seas_id:player,age:experience,g_percent_diff:been_allstar_before)
+  select(seas_id:player,experience,g_percent_diff:been_allstar_before)
 ```
 
 For predicting candidates in 2022, it's a much more diverse subset. So we'll just remove some of the irrelevant factors from the data.
 
 ```{r next_seas_dataframe}
-full_data<-final_data %>% select(seas_id:player,age:experience,
+full_data<-final_data %>% select(seas_id:player,experience,
                                  g_percent:been_allstar_before) %>%
   select(-c(mp,share))
 ```
@@ -441,7 +441,7 @@ Let's get the most important variables of the linear model.
 prettify_vip(lin_this_yr,"Linear_2021_Prediction Variable Importance")
 ```
 
-The most important variable is the difference in minutes per game. As a player gets more time on the court, there's more opportunity to rack up positive stats like rebounds, assists and blocks but also negative stats like personal fouls and turnovers. The new experience variable checks in as the 7th-most important variable in the linear variable. Offensive improvement is easier to recognize than defensive improvement, so it makes sense that we see offensive win shares in the top 10 and not defensive win shares.
+The most important variable is the difference in minutes per game. As a player gets more time on the court, there's more opportunity to rack up positive stats like rebounds, assists and blocks but also negative stats like personal fouls and turnovers. Offensive improvement is easier to recognize than defensive improvement, so it makes sense that we see offensive win shares in the top 10 and not defensive win shares.
 
 Next up is the k-nearest neighbors model. The intuition behind using this model is that maybe Most Improved Player winners are most similar to other winners. We can tune the neighbors parameter to change how many neighbors to compare to. We check values from 5 to 50.
 
@@ -456,7 +456,7 @@ wf <- wf %>% finalize_workflow(tune_knn %>% select_best(metric="rmse"))
 knn_this_yr=fit(wf,jumps_trainer)
 tune_knn %>% select_best(metric="rmse") %>% knitr::kable()
 ```
-Looks like the optimal amount of neighbors is 41.
+Looks like the optimal amount of neighbors is 29.
 
 The next model is a random forest which return the average of multiple decision trees. The intuition behind using models from the decision tree family is that maybe there are certain statistical thresholds that a potential MIP winner needs to meet in order to merit consideration. As a player passes more of these checkpoints, their vote share increases. Random forests are better than decision trees in that they reduce instability by averaging multiple trees. Unfortunately, the cost is interpretability. There is no tree diagram that is representative of the decisions made. With *random* forest algorithms, we need to set a seed to keep the work reproducible.
 
@@ -487,7 +487,7 @@ tune_forest %>% select_best(metric="rmse") %>% knitr::kable()
 prettify_vip(ranger_this_yr,"Ranger_2021_Prediction Variable Importance")
 ```
 
-The top 5 variables all heed from the per-game subset, with the top 2 in separate tiers of importance from the others.
+The top 10 variables all heed from the per-game subset, with the top 2 in a separate tier of importance from the others.
 
 Finally, we train the support vector machine on the model. SVMs attempt to separate classes with a hyperplane. Support vectors are the points closest to the hyperplane, named as such because the hyperplane would change if those points were removed. 
 
@@ -524,9 +524,10 @@ model_results<-bind_rows(model_results,
                          eval_table(svm_this_yr,"SVM",tune_svm))
 model_results %>% knitr::kable()
 ```
-The vote shares are quite low, but especially so for both the linear & SVM models. The highest shars in the linear and SVM models are less than half the 3rd highest share in the knn model. Ellis & Michael Jordan are present in all 4 top 3s, while the third candidate varies. In the linear model, Jordan even finishes first. This is somewhat misleading, because Jordan broke his foot the previous year and missed 64 games. He came back with a vengeance, upping his points per game by 14.4. But Jordan was already a star, and stars are implicitly excluded from winning MIP. I'd hoped that including the variable of being an All-Star prior to the current season would alleviate this problem, but it wasn't a big factor in the linear model. 
+The vote shares are quite low, but especially so for both the linear & SVM models. The highest shars in the linear and SVM models are less than half the 3rd highest share in the knn model. Ellis & Michael Jordan are present in all 4 top 3s, while the third candidate varies. In the linear model, Jordan even finishes first. This is somewhat misleading, because Jordan broke his foot the previous year and missed 64 games. He came back with a vengeance, upping his points per game by 14.4. But Jordan was already a star, and stars are implicitly excluded from winning MIP. I'd hoped that including the variable of being an All-Star prior to the current season would alleviate this problem, but it wasn't a big factor in the models. 
 
 Thorpe is a worthy candidate: he increased his scoring by nine points and WS/48 by 0.04 while decreasing his turnover percentage. Cartwright's case is similar to Jordan as a player who didn't play often in the previous season due to injury.
+
 
 ### Models to Predict 2022 MIP Candidates
 
@@ -553,7 +554,6 @@ return(results_tib)
 }
 ```
 
-
 We will apply the same algorithms we used for predicting the 2021 winner. We'll continue to evaluate performance using RMSE but now we have 2 test sets: 1986 and 2020.
 
 ```{r common_next_year_steps}
@@ -562,7 +562,7 @@ next_year_recipe<-recipe(share_next_seas ~ .,data=full_split) %>%
   step_dummy(been_allstar_before) %>% 
   update_role(seas_id:player,new_role="id")
 ```
-
+Once again, we'll start with the linear regression.
 ```{r next_year_linear}
 wf <- workflow() %>% add_recipe(next_year_recipe) %>%
   add_model(linear_reg() %>% set_engine("lm") %>% set_mode("regression"))
@@ -576,3 +576,55 @@ Let's get the most important variables of the linear model.
 ```{r linear_nxt_top_vars,echo=FALSE,fig.align='center',out.width="100%"}
 prettify_vip(lin_next_yr,"Linear_2022_Prediction Variable Importance")
 ```
+
+```{r next_year_knn}
+wf <- workflow() %>% add_recipe(next_year_recipe) %>%
+  add_model(nearest_neighbor(neighbors = tune()) %>% 
+  set_engine("kknn") %>% set_mode("regression"))
+tune_knn <- wf %>% tune_grid(resamples=next_year_cv,
+                             grid=expand.grid(neighbors=5:50),
+                             metrics=metric_set(rmse))
+wf <- wf %>% finalize_workflow(tune_knn %>% select_best(metric="rmse"))
+knn_next_yr=fit(wf,trainer)
+tune_knn %>% select_best(metric="rmse") %>% knitr::kable()
+```
+
+```{r next_year_ranger}
+wf <- workflow() %>% add_recipe(next_year_recipe) %>%
+  add_model(rand_forest(mtry = tune()) %>% 
+  set_engine("ranger",importance="permutation") %>% set_mode("regression"))
+tune_forest<-wf %>% tune_grid(resamples=next_year_cv,
+                              grid=expand.grid(mtry=5:10),
+                              metrics=metric_set(rmse))
+wf <-wf %>% finalize_workflow(tune_forest %>% select_best(metric="rmse"))
+ranger_next_yr=fit(wf,trainer)
+tune_forest %>% select_best(metric="rmse") %>% knitr::kable()
+```
+
+```{r ranger_nxt_top_vars,echo=FALSE,fig.align='center',out.width="100%"}
+prettify_vip(ranger_next_yr,"Ranger_2022_Prediction Variable Importance")
+```
+
+
+```{r next_year_svm}
+wf <- workflow() %>% add_recipe(next_year_recipe) %>%
+  add_model(svm_rbf(rbf_sigma=tune(),cost=tune()) %>% 
+  set_engine("kernlab") %>% set_mode("regression"))
+tune_svm<-wf %>% tune_grid(resamples=next_year_cv,
+                           grid=expand.grid(rbf_sigma=0.1^seq(2:5),
+                                            cost=c(0.25,0.5,1)),
+                              metrics=metric_set(rmse))
+wf <-wf %>% finalize_workflow(tune_svm %>% select_best(metric="rmse"))
+svm_next_yr=fit(wf,trainer)
+tune_svm %>% select_best(metric="rmse") %>% knitr::kable()
+```
+
+
+```{r next_yr_metrics,echo=FALSE}
+model_results=eval_table_next_yr(lin_next_yr,"Linear",tune_lin)
+model_results<-bind_rows(model_results,
+                         eval_table_next_yr(knn_next_yr,"KNN",tune_knn),
+                         eval_table_next_yr(ranger_next_yr,"Ranger",tune_forest),
+                         eval_table_next_yr(svm_next_yr,"SVM",tune_svm))
+model_results %>% knitr::kable() %>%
+  kable_styling(latex_options="scale_down")
