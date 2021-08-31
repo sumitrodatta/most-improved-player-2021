@@ -2,9 +2,10 @@
 title: "Predicting the Winner of NBA's 2021 Most Improved Player Award, and Finding Candidates for 2022"
 author: "Sumitro Datta"
 date: "`r format(Sys.time(), '%B %d, %Y')`"
+header-includes:
+- \usepackage{booktabs}
 output: 
-  pdf_document:
-    latex_engine: xelatex
+  pdf_document
 ---
 
 ```{r setup, include=FALSE}
@@ -159,11 +160,14 @@ mip_share=read_csv("Data/Player Award Shares.csv",col_types = cols(
 )) %>% filter(award=="mip") %>% select(season,seas_id:tm,share)
 ```
 
-While the MIP share is tracked for the season in which the vote was received, it will also be tracked for the season prior. The latter column will help identify candidates for next season. For example, Pascal Siakam of the Toronto Raptors won the MIP award in 2019 with an MIP vote share of 0.938. This would be recorded in Siakam's 2019 season under `share` and in Siakam's 2018 Season under `share_next_seas`.
+While the MIP share is tracked for the season in which the vote was received, it will also be tracked for the season prior. The latter column will help identify candidates for next season. For example, Pascal Siakam of the Toronto Raptors won the MIP award in 2019 with an MIP vote share of 0.938. This would be recorded in Siakam's 2019 season under `share` and in Siakam's 2018 Season under `share_next_seas`. Another column based on the MIP vote share is the cumulative share received by a player in previous seasons. This should lessen the future predictions of past MIP winners & those who finished as high runner-ups, as their improvement was already recognized.
 
 ```{r add_share_next_seas,results='hide'}
-stats_and_share=left_join(combined,mip_share) %>% group_by(player_id) %>% arrange(season) %>%
-  mutate(share_next_seas=lead(share)) %>% ungroup()
+stats_and_share=left_join(combined,mip_share) %>% 
+  mutate(share=replace_na(share,0)) %>% group_by(player_id) %>% arrange(season) %>%
+  mutate(share_next_seas=lead(share),
+         share_before_current_seas=cumsum(share)-share) %>% 
+  ungroup()
 ```
 
 The last file that will be loaded is the All-Star Selections comma-separated values file. I noticed last year that established players were factoring into my models more than I'd like. These players were under-performing due to injury and returning to their regular star level a year later. I initially thought that the number of All-Star selections a player has had prior to the current season could act as a proxy to a player's regular talent level. However, it might suffice to just determine whether or not a player has ever been an All-Star, effectively turning this into a categorical predictor with only 2 possible values rather than a numeric one with multiple. After joining the All-Star data with the statistics and vote share data, our last transformation is to remove seasons prior to 1984-1985 (which is one season before the inaugural awarding of the MIP award).
@@ -194,7 +198,6 @@ Looks like there's a significant amount of missing data, but it can be broken do
 * the NA's in the shooting percentages are due to a lack of attempts
 * the consistent 3 NA's in the per-100-possessions and advanced stats are due to a lack of data, as those 3 players played less than a minute of game time
   + the rest of the NA's in per-100-possessions & advanced can also be attributed to a lack of data, but rather than minutes played, it is the absence of the stat itself
-* all the players who never received an MIP vote have NA's
 * all the players who don't need a birth year to separate them from another player with the same name also have an NA
 
 The above NA's can all be converted to zeroes.
@@ -330,7 +333,7 @@ full_jumps_data<-final_data %>%
             .funs=funs(`diff`=.-lag(.,default=first(.)))) %>%
   #do not keep the raw stats, only differences
   select(seas_id:tm, g_percent_diff:pts_per_game_diff,x3p_per_100_poss_diff:vorp_diff,
-         share,been_allstar_before) %>% 
+         share,share_before_current_seas,been_allstar_before) %>% 
   #remove first season from every group (no difference)
   slice(-1) %>% arrange(seas_id) %>% ungroup() %>% 
   #do not keep irrelevant information
@@ -456,7 +459,7 @@ wf <- wf %>% finalize_workflow(tune_knn %>% select_best(metric="rmse"))
 knn_this_yr=fit(wf,jumps_trainer)
 tune_knn %>% select_best(metric="rmse") %>% knitr::kable()
 ```
-Looks like the optimal amount of neighbors is 29.
+Looks like the optimal amount of neighbors is 38.
 
 The next model is a random forest which return the average of multiple decision trees. The intuition behind using models from the decision tree family is that maybe there are certain statistical thresholds that a potential MIP winner needs to meet in order to merit consideration. As a player passes more of these checkpoints, their vote share increases. Random forests are better than decision trees in that they reduce instability by averaging multiple trees. Unfortunately, the cost is interpretability. There is no tree diagram that is representative of the decisions made. With *random* forest algorithms, we need to set a seed to keep the work reproducible.
 
@@ -487,7 +490,7 @@ tune_forest %>% select_best(metric="rmse") %>% knitr::kable()
 prettify_vip(ranger_this_yr,"Ranger_2021_Prediction Variable Importance")
 ```
 
-The top 10 variables all heed from the per-game subset, with the top 2 in a separate tier of importance from the others.
+The top 8 variables all heed from the per-game subset, with the advanced stat of value over replacement player sneaking into the number 9 spot. The top 2 variables of difference in points per game and difference in minutes per game are in a separate tier of importance from the others.
 
 Finally, we train the support vector machine on the model. SVMs attempt to separate classes with a hyperplane. Support vectors are the points closest to the hyperplane, named as such because the hyperplane would change if those points were removed. 
 
@@ -522,9 +525,11 @@ model_results<-bind_rows(model_results,
                          eval_table(knn_this_yr,"KNN",tune_knn),
                          eval_table(ranger_this_yr,"Ranger",tune_forest),
                          eval_table(svm_this_yr,"SVM",tune_svm))
-model_results %>% knitr::kable()
+model_results %>% knitr::kable() %>%
+  kable_styling(latex_options="scale_down") %>%
+  kable_styling(latex_options = "HOLD_position")
 ```
-The vote shares are quite low, but especially so for both the linear & SVM models. The highest shars in the linear and SVM models are less than half the 3rd highest share in the knn model. Ellis & Michael Jordan are present in all 4 top 3s, while the third candidate varies. In the linear model, Jordan even finishes first. This is somewhat misleading, because Jordan broke his foot the previous year and missed 64 games. He came back with a vengeance, upping his points per game by 14.4. But Jordan was already a star, and stars are implicitly excluded from winning MIP. I'd hoped that including the variable of being an All-Star prior to the current season would alleviate this problem, but it wasn't a big factor in the models. 
+The vote shares are quite low, but especially so for both the linear & SVM models. The highest shares in the linear and SVM models are less than half the 3rd highest share in the knn model. Ellis & Michael Jordan are present in all 4 top 3s, while the third candidate varies. In the linear model, Jordan even finishes first. This is somewhat misleading, because Jordan broke his foot the previous year and missed 64 games. He came back with a vengeance, upping his points per game by 14.4. But Jordan was already a star, and stars are implicitly excluded from winning MIP. I'd hoped that including the variable of being an All-Star prior to the current season would alleviate this problem, but it wasn't a big factor in the models. 
 
 Thorpe is a worthy candidate: he increased his scoring by nine points and WS/48 by 0.04 while decreasing his turnover percentage. Cartwright's case is similar to Jordan as a player who didn't play often in the previous season due to injury.
 
@@ -577,6 +582,8 @@ Let's get the most important variables of the linear model.
 prettify_vip(lin_next_yr,"Linear_2022_Prediction Variable Importance")
 ```
 
+Two of the new variables of experience and previous All-Star recognition are the most important variables in the linear model, with the third of accumulated vote share in previous seasons placing 6th.
+
 ```{r next_year_knn}
 wf <- workflow() %>% add_recipe(next_year_recipe) %>%
   add_model(nearest_neighbor(neighbors = tune()) %>% 
@@ -588,6 +595,8 @@ wf <- wf %>% finalize_workflow(tune_knn %>% select_best(metric="rmse"))
 knn_next_yr=fit(wf,trainer)
 tune_knn %>% select_best(metric="rmse") %>% knitr::kable()
 ```
+
+The maximum number of neighbors tested seems to produce the best results, with 50 neighbors needed to determine a player's MIP share in the next season.
 
 ```{r next_year_ranger}
 wf <- workflow() %>% add_recipe(next_year_recipe) %>%
@@ -601,10 +610,12 @@ ranger_next_yr=fit(wf,trainer)
 tune_forest %>% select_best(metric="rmse") %>% knitr::kable()
 ```
 
+Here's the most important variables in the random forest model.
 ```{r ranger_nxt_top_vars,echo=FALSE,fig.align='center',out.width="100%"}
 prettify_vip(ranger_next_yr,"Ranger_2022_Prediction Variable Importance")
 ```
 
+The top 4 most important variables are from the per-game subset.
 
 ```{r next_year_svm}
 wf <- workflow() %>% add_recipe(next_year_recipe) %>%
@@ -619,7 +630,7 @@ svm_next_yr=fit(wf,trainer)
 tune_svm %>% select_best(metric="rmse") %>% knitr::kable()
 ```
 
-
+Let's check up on our performance metrics. We'll be checking two separate sets of candidates: 1987 using 1986 season stats and 2021 using 2020 season stats.
 ```{r next_yr_metrics,echo=FALSE}
 model_results=eval_table_next_yr(lin_next_yr,"Linear",tune_lin)
 model_results<-bind_rows(model_results,
@@ -627,4 +638,11 @@ model_results<-bind_rows(model_results,
                          eval_table_next_yr(ranger_next_yr,"Ranger",tune_forest),
                          eval_table_next_yr(svm_next_yr,"SVM",tune_svm))
 model_results %>% knitr::kable() %>%
-  kable_styling(latex_options="scale_down")
+  kable_styling(latex_options="scale_down") %>%
+  kable_styling(latex_options = "HOLD_position")
+```
+The RMSEs are similar across all 4 models. Stockton is the only player who appears in multiple top 3s for 1987, while Adebayo, Young & Donćić accomplish the same feat for 2021. There have been no repeat MIP winners, which does not bode well for the inclusion of Robertson (1986). Barkley & Wilkins received votes in the previous year, finishing second & fourth. On the 2021 side, every listed candidate save for Oubre, Jackson Jr. & Clarke has received votes in prior seasons.
+
+Harden has already won an MVP award, and there's not much feasible improvement that can be done above that level. The aforementioned trio of players who appeared on multiple 2021 model top 3s have all been All-Star selections before. Brown made his first All-Star team in 2021, but it could be more than reasonably argued that his leap happened in the season prior. SGA was given the keys to the offense of the tanking Thunder, but he was shut down for the second half of the season. Clarke & Jackson Jr. are Memphis teammates, with JJJ missing almost the entire season after meniscus surgery and Clarke failing to take advantage of that absence by seizing a starting lineup spot. Oubre was traded to the Warriors, with the thinking being that he would benefit from Steph Curry's gravity pulling away defenders, but he opened the season in a brutal shooting slump.
+
+Stockton's underlying stats primed him for a breakout, but it wasn't until 1988 that he started the majority of games for the Utah Jazz and received MIP votes. This will be a recurring caveat, since we can't predict opportunity/playing time. Rivers did improve significantly in advanced stats, but his points per game moved up marginally. He helped the team through playmaking and defense. Lister is the first candidate we've seen that received extra opportunity. While he increased his per game statistics due to being given 8 more minutes of playing time per game, his rate statistics dropped.
