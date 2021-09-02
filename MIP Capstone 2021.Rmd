@@ -227,14 +227,14 @@ rm(dale_ellis)
 kable(mip_winners[,c(1:2,4)],booktabs=TRUE) %>% kable_styling(position="center")
 ```
 
-There are three seasons that have a vote share of zero: 1985 (which was the season before the first awarding of the MIP), 2021 (which is the season we are trying to predict for) and 1987.  
+There are two seasons that have a vote share of zero: 1985 (which was the season before the first awarding of the MIP) and 1987.  
 
 There was an MIP award given out in 1987 to Dale Ellis of the Seattle SuperSonics. However, when researching, I could not find any voting records for the season. I'll discuss what I plan to do with this season a little further in the report.
 
-Secondly, we'll plot the scoring per game of the MIP winners. The three missing seasons (1985,1987,2020) have been removed.
+Secondly, we'll plot the scoring per game of the MIP winners. The two missing seasons (1985,1987) have been removed.
 ```{r mip_ppg, fig.align='center',echo=FALSE,out.width="100%"}
 # take out missing seasons
-mip_winners <- mip_winners %>% filter (!(season %in% c(1985,2021)))
+mip_winners <- mip_winners %>% filter (season != 1985)
 #remove repeated columns
 mip_stats <- left_join(mip_winners,final_data)
 ppg_mip <- mip_stats %>%
@@ -646,3 +646,57 @@ The RMSEs are similar across all 4 models. Stockton is the only player who appea
 Harden has already won an MVP award, and there's not much feasible improvement that can be done above that level. The aforementioned trio of players who appeared on multiple 2021 model top 3s have all been All-Star selections before. Brown made his first All-Star team in 2021, but it could be more than reasonably argued that his leap happened in the season prior. SGA was given the keys to the offense of the tanking Thunder, but he was shut down for the second half of the season. Clarke & Jackson Jr. are Memphis teammates, with JJJ missing almost the entire season after meniscus surgery and Clarke failing to take advantage of that absence by seizing a starting lineup spot. Oubre was traded to the Warriors, with the thinking being that he would benefit from Steph Curry's gravity pulling away defenders, but he opened the season in a brutal shooting slump.
 
 Stockton's underlying stats primed him for a breakout, but it wasn't until 1988 that he started the majority of games for the Utah Jazz and received MIP votes. This will be a recurring caveat, since we can't predict opportunity/playing time. Rivers did improve significantly in advanced stats, but his points per game moved up marginally. He helped the team through playmaking and defense. Lister is the first candidate we've seen that received extra opportunity. While he increased his per game statistics due to being given 8 more minutes of playing time per game, his rate statistics dropped.
+
+# Results
+
+We've trained our models, and now it's time to test them on the 2021 data.
+
+## 2021 Winner
+We won't use the linear or SVM model to generate predictions, as their predictions were too low (and in the linear case, didn't meet expectations of Dale Ellis finishing first).
+
+```{r winner_this_year_pred,echo=FALSE}
+pred_join_stats<-function(model,data_to_pred,rename_var){
+  rename_var=enquo(rename_var)
+  a<-bind_cols(data_to_pred,predict(model,new_data=data_to_pred)) %>%
+    rename(!!rename_var := .pred)
+  return(a)
+}
+knn_pred=pred_join_stats(knn_this_yr,eval_jumps_2021,"knn_p")
+ranger_pred=pred_join_stats(ranger_this_yr,eval_jumps_2021,"ranger_p")
+
+mean_pred=left_join(knn_pred,ranger_pred) %>% rowwise() %>%
+  mutate(mean=mean(c_across(knn_p:ranger_p))) %>% ungroup()
+mean_pred %>% slice_max(mean,n=5) %>% select(player,knn_p,ranger_p,mean) %>% kable()
+```
+Grant has the highest prediction under the KNN model as well as the highest mean prediction between the two models. Curry receives the highest vote share under the ranger model, which is a cause for concern as he's already won 2 MVP trophies. The other problem with his candidacy is exactly the same as that of Michael Jordan: he only played 5 games last year due to injury. Khyri Thomas, with the second-highest share in the ranger model, played 8 games last year and only 5 games this year for a tanking Rockets team. The Porters (no relation) both made strides in their second year in the league.
+
+Let's now take a look at the actual results.
+```{r winner_this_year_actual,echo=FALSE}
+eval_jumps_2021 %>% filter(share != 0) %>% arrange(desc(share)) %>% left_join(.,mean_pred) %>% select(player,share,knn_p,ranger_p,mean) %>% kable()
+```
+Randle, the actual winner, didn't place in the top 5 of predictions, which is not ideal to say the least. Small consolation in Grant & MPJ finishing 2nd and 3rd, but not a great showing overall.
+
+## 2022 Winner
+With the RMSEs being closer, we'll use all four models.
+```{r next_year_pred,echo=FALSE}
+lin_pred_next=pred_join_stats(lin_next_yr,eval_2021,"lin_p")
+knn_pred_next=pred_join_stats(knn_next_yr,eval_2021,"knn_p")
+ranger_pred_next=pred_join_stats(ranger_next_yr,eval_2021,"ranger_p")
+svm_pred_next=pred_join_stats(svm_next_yr,eval_2021,"svm_p")
+
+mean_pred_next=left_join(lin_pred_next,knn_pred_next) %>% 
+  left_join(.,ranger_pred_next) %>% left_join(.,svm_pred_next) %>% rowwise() %>%
+  mutate(mean=mean(c_across(lin_p:svm_p))) %>% ungroup()
+
+top_5_tibble<-function(df,var,model_name){
+  a<-df %>% slice_max({{var}},n=5) %>% select(player,{{var}}) %>% 
+    bind_cols("Model"=model_name) %>% relocate("Model",.before="player")
+  return (a)
+}
+
+bind_rows(top_5_tibble(lin_pred_next,lin_p,"Linear"),
+          top_5_tibble(knn_pred_next,knn_p,"KNN"),
+          top_5_tibble(ranger_pred_next,ranger_p,"Ranger"),
+          top_5_tibble(svm_pred_next,svm_p,"SVM")) %>% kable()
+```
+
