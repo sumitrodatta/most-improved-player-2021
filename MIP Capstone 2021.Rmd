@@ -676,7 +676,7 @@ eval_jumps_2021 %>% filter(share != 0) %>% arrange(desc(share)) %>% left_join(.,
 ```
 Randle, the actual winner, didn't place in the top 5 of predictions, which is not ideal to say the least. Small consolation in Grant & MPJ finishing 2nd and 3rd, but not a great showing overall.
 
-## 2022 Winner
+## 2022 Candidates
 With the RMSEs being closer, we'll use all four models.
 ```{r next_year_pred,echo=FALSE}
 lin_pred_next=pred_join_stats(lin_next_yr,eval_2021,"lin_p")
@@ -689,14 +689,32 @@ mean_pred_next=left_join(lin_pred_next,knn_pred_next) %>%
   mutate(mean=mean(c_across(lin_p:svm_p))) %>% ungroup()
 
 top_5_tibble<-function(df,var,model_name){
-  a<-df %>% slice_max({{var}},n=5) %>% select(player,{{var}}) %>% 
-    bind_cols("Model"=model_name) %>% relocate("Model",.before="player")
+  a<-df %>% slice_max({{var}},n=5) %>% select(player,experience,{{var}}) %>% 
+    bind_cols("Model"=model_name) %>% relocate("Model",.before="player") %>%
+    rename("Predicted Vote Share"={{var}})
   return (a)
 }
 
 bind_rows(top_5_tibble(lin_pred_next,lin_p,"Linear"),
           top_5_tibble(knn_pred_next,knn_p,"KNN"),
           top_5_tibble(ranger_pred_next,ranger_p,"Ranger"),
-          top_5_tibble(svm_pred_next,svm_p,"SVM")) %>% kable()
-```
+          top_5_tibble(svm_pred_next,svm_p,"SVM")) %>% kable() %>%
+  row_spec(0,bold=T) %>%
+  row_spec(seq(5,25,5),hline_after=T)
 
+mean_pred_next %>% slice_max(mean,n=5) %>% select(player,mean) %>% kable()
+```
+Save for Andrew Wiggins and Jakob Poeltl, every player in any of the four top 5s has a maximum of 4 years of experience. Jackson & Clarke show up once again, and their teammate Xavier Tillman Sr makes an appearance. If all three improve, there might be a case of vote-splitting. Bryant played only one game, which was the last game of the season for the Milwaukee Bucks as they rested their main players to gear up for the playoffs. Ball, Edwards & Haliburton were the top 3 players in Rookie of the Year voting, so improvement is kind of "expected" for them.
+
+Williams & Bridges are young players that excel in their roles, but it's somewhat difficult to project where they can get those extra shot attempts to boost their scoring in Boston & Phoenix respectively. They're at best the 4th scoring options on their teams: Devin Booker, Chris Paul & Deandre Ayton are at the top of the pecking order for the Suns, while Jayson Tatum, Jaylen Brown and Dennis Schroder figure to soak up a majority of touches for the Celtics. Bogdanovic is in a similar situation in Atlanta, with arguably an even deeper roster and therefore a more muddled hierarchy.
+
+The best bet in my opinion is Kevin Porter Jr. After being traded mid-season from the Cavaliers to the Rockets, he was given the keys to the offense. With a full offseason under his belt and the Rockets still in rebuild mode, there's not much shot creating competition apart from rookie Jalen Green.
+
+# Conclusion
+Using a database of individual player seasons from 1984 to 2021, we set out to predict both the 2021 Most Improved Player award winner, as well as MIP candidates for 2022. Using the mean of a knn model & a ranger random forest that were trained on statistical jumps data (current season statistics minus previous season statistics), **Jerami Grant** was projected to be the 2021 winner. Rounding out the top 5 are Stephen Curry, Khyri Thomas, Michael Porter Jr and Kevin Porter Jr. The actual winner was Julius Randle, while Grant & MPJ finished second and third. Using the mean and median for four models (the previously mentioned two as well as linear & SVM) trained on regular season data, the top 5 candidates for 2022 are Xavier Tillman Sr, Kevin Porter Jr, Andrew Wiggins, Elijah Bryant and Tyrese Haliburton.
+
+Both models suffer from the inability to quantify intangibles such as narrative and popularity. Julius Randle plays in New York, which is the NBA's biggest media market. While I'd hoped using the games played percentage would be able to somewhat help in distinguishing playing too few games due to injury or genuinely bad play, Steph Curry still finished second in projected voting despite already claiming two Most Valuable Player awards earlier in his career. The 2021 candidates model is limited by the fact that we can't predict opportunity.
+
+By nature, the per game & per 100 possessions statistics are very correlated. I didn't remove highly correlated variables by design, as I wanted the models themselves to perform feature selection and determine what the most important variables were.
+
+Further improvements could be only focusing on seasons after 2003, which is when the voting system changed from only first-place votes to three-place ballots. In addition, it might be better (if possible) to compare the current season to a player's career up to that point rather than just the previous season. This would immensely help with the injury-or-bad-player conundrum.
